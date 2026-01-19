@@ -11,6 +11,38 @@ DaemonMode=false
 SleepInterval=10
 StrictMem=false
 
+usage() {
+    echo "Usage: $0 [options] [gpu_index]"
+    echo
+    echo "Options:"
+    echo "  -p, --physical-only  Use only physical CPU cores (skip SMT/HT siblings)"
+    echo "  -d, --daemon         Run in daemon mode (check every $SleepInterval seconds)"
+    echo "  -s, --strict         Strict memory policy (OOM risk, but guaranteed local memory)"
+    echo "  -h, --help           Show this help message"
+    echo
+    echo "Arguments:"
+    echo "  gpu_index            Index of the GPU from lspci (default: 0)"
+    exit 0
+}
+
+check_dependencies() {
+    local deps=("lspci" "fuser" "taskset" "numactl" "migratepages" "awk" "ps")
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo "Error: Required command '$cmd' not found."
+            exit 1
+        fi
+    done
+}
+
+log() {
+    if [ "$DaemonMode" = true ]; then
+        logger -t gpu-numa-tune "$1"
+    else
+        echo "$1"
+    fi
+}
+
 # --- Root Check & Validated System Tuning ---
 system_tune() {
     if [ "$EUID" -eq 0 ]; then
@@ -44,32 +76,55 @@ system_tune() {
     fi
 }
 
-system_tune
-
 # 1. Argument Parsing
 while [[ "$1" =~ ^- ]]; do
     case $1 in
         -p|--physical-only) UseHt=false; shift ;;
         -d|--daemon) DaemonMode=true; shift ;;
         -s|--strict) StrictMem=true; shift ;;
-        *) echo "Unknown option: $1" ; exit 1 ;;
+        -h|--help) usage ;;
+        *) echo "Unknown option: $1" ; usage ;;
     esac
 done
+
+check_dependencies
+system_tune
 
 # 2. Identify GPUs (NVIDIA, AMD, Intel)
 mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
 gpu_index_arg=${1:-0}
+
+if [ "${#all_vga_devices[@]}" -eq 0 ]; then
+    echo "Error: No GPU (VGA/3D) devices detected via lspci."
+    exit 1
+fi
+
+if [ "$gpu_index_arg" -ge "${#all_vga_devices[@]}" ]; then
+    echo "Error: GPU index $gpu_index_arg not found (Found ${#all_vga_devices[@]} GPUs)."
+    exit 1
+fi
+
 pci_addr=$(echo "${all_vga_devices[$gpu_index_arg]}" | awk '{print $1}')
 
 if [ -z "$pci_addr" ]; then
-    echo "Error: GPU index $gpu_index_arg not found."
+    echo "Error: Could not determine PCI address for GPU index $gpu_index_arg."
     exit 1
 fi
 
 # 3. Identify NUMA Node and CPU List
 device_sys_dir="/sys/bus/pci/devices/$pci_addr"
-numa_node_id=$(cat "$device_sys_dir/numa_node")
-raw_cpu_list=$(cat "$device_sys_dir/local_cpulist")
+if [ ! -d "$device_sys_dir" ]; then
+    echo "Error: PCI device directory $device_sys_dir not found."
+    exit 1
+fi
+
+numa_node_id=$(cat "$device_sys_dir/numa_node" 2>/dev/null || echo -1)
+raw_cpu_list=$(cat "$device_sys_dir/local_cpulist" 2>/dev/null || echo "")
+
+if [ -z "$raw_cpu_list" ]; then
+    echo "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
+    raw_cpu_list=$(cat /sys/devices/system/cpu/online 2>/dev/null)
+fi
 
 # 4. Filter CPU List (HT vs Physical)
 final_cpu_mask=""
@@ -118,11 +173,14 @@ echo "--------------------------------------------------------"
 
 # 5. Optimization Function
 run_optimization() {
-    local node_free_kb=$(get_node_free_kb "$numa_node_id")
-    # Cross-vendor PID detection
-    local gpu_pids=$(fuser /dev/dri/* /dev/nvidia* 2>/dev/null | tr ' ' '\n' | sort -u)
+    local node_free_kb=0
+    [ "$numa_node_id" -ge 0 ] && node_free_kb=$(get_node_free_kb "$numa_node_id")
+
+    # Cross-vendor PID detection (Render nodes and NVIDIA devices)
+    local gpu_pids=$(fuser /dev/dri/renderD* /dev/nvidia* 2>/dev/null | tr ' ' '\n' | sort -u)
 
     for pid in $gpu_pids; do
+        [[ -z "$pid" ]] && continue
         if [ "$pid" -lt 100 ] || [ ! -d "/proc/$pid" ]; then continue; fi
         if [ "$EUID" -ne 0 ] && [ ! -O "/proc/$pid" ]; then continue; fi
 
