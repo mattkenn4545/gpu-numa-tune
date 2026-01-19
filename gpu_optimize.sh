@@ -10,6 +10,7 @@ UseHt=true
 DaemonMode=false
 SleepInterval=10
 StrictMem=false
+OnlyGaming=true
 
 usage() {
     echo "Usage: $0 [options] [gpu_index]"
@@ -18,6 +19,7 @@ usage() {
     echo "  -p, --physical-only  Use only physical CPU cores (skip SMT/HT siblings)"
     echo "  -d, --daemon         Run in daemon mode (check every $SleepInterval seconds)"
     echo "  -s, --strict         Strict memory policy (OOM risk, but guaranteed local memory)"
+    echo "  -a, --all-gpu-procs  Optimize ALL processes using the GPU (not just games)"
     echo "  -h, --help           Show this help message"
     echo
     echo "Arguments:"
@@ -82,6 +84,7 @@ while [[ "$1" =~ ^- ]]; do
         -p|--physical-only) UseHt=false; shift ;;
         -d|--daemon) DaemonMode=true; shift ;;
         -s|--strict) StrictMem=true; shift ;;
+        -a|--all-gpu-procs) OnlyGaming=false; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1" ; usage ;;
     esac
@@ -157,6 +160,16 @@ get_node_free_kb() {
     echo "${free_kb:-0}"
 }
 
+get_node_total_mb() {
+    local total_kb=$(grep -i "Node $1 MemTotal" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
+    echo "$(( ${total_kb:-0} / 1024 ))"
+}
+
+get_node_used_mb() {
+    local used_kb=$(grep -i "Node $1 MemUsed" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
+    echo "$(( ${used_kb:-0} / 1024 ))"
+}
+
 target_normalized_mask=$(normalize_affinity "$final_cpu_mask")
 mem_policy_label=$([ "$StrictMem" = true ] && echo "Strict (OOM Risk)" || echo "Preferred (Safe)")
 
@@ -164,12 +177,59 @@ mem_policy_label=$([ "$StrictMem" = true ] && echo "Strict (OOM Risk)" || echo "
 echo "OPTIMIZING GPU   : $pci_addr"
 echo "MODEL            :$(lspci -s "$pci_addr" | cut -d: -f3)"
 echo "NUMA NODE        : $numa_node_id"
+
+if [ "$numa_node_id" -ge 0 ]; then
+    echo "NUMA NODE SIZE   : $(get_node_total_mb "$numa_node_id") MB"
+    echo "NUMA NODE USED   : $(get_node_used_mb "$numa_node_id") MB"
+fi
+
 echo "CPU TARGETS      : $final_cpu_mask"
 echo "MEM POLICY       : $mem_policy_label"
+echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
 echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
 echo "--------------------------------------------------------"
 printf "%-8s | %-15s | %-25s | %s\n" "PID" "EXE" "STATUS" "COMMAND"
 echo "--------------------------------------------------------"
+
+is_gaming_process() {
+    local pid="$1"
+    [ "$OnlyGaming" = false ] && return 0
+
+    # 1. Known Blacklist (Non-gaming GPU heavy apps)
+    local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+    case "$proc_comm" in
+        Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) return 1 ;;
+        chrome|firefox|brave|msedge|opera|browser) return 1 ;;
+        steamwebhelper|Discord|slack|teams|obs|obs64) return 1 ;;
+    esac
+
+    # 2. Gaming Environment Variables
+    if [ -r "/proc/$pid/environ" ]; then
+        # Check for Steam, Proton, Lutris, Heroic markers
+        if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qE "^(STEAM_COMPAT_APP_ID|STEAM_GAME_ID|LUTRIS_GAME_ID|HEROIC_APP_NAME|PROTON_VER|WINEPREFIX)="; then
+            return 0
+        fi
+    fi
+
+    # 3. Heuristics (Wine/Proton processes, Game executables)
+    local proc_args=$(ps -fp "$pid" -o args= 2>/dev/null)
+    if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer"; then
+        return 0
+    fi
+
+    # 4. Check Parent Processes (up to 3 levels)
+    local ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+    for i in {1..3}; do
+        [ -z "$ppid" ] || [ "$ppid" -lt 10 ] && break
+        local p_comm=$(ps -p "$ppid" -o comm= 2>/dev/null)
+        case "$p_comm" in
+            steam|lutris|heroic|wine|wineserver) return 0 ;;
+        esac
+        ppid=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ')
+    done
+
+    return 1
+}
 
 # 5. Optimization Function
 run_optimization() {
@@ -183,6 +243,8 @@ run_optimization() {
         [[ -z "$pid" ]] && continue
         if [ "$pid" -lt 100 ] || [ ! -d "/proc/$pid" ]; then continue; fi
         if [ "$EUID" -ne 0 ] && [ ! -O "/proc/$pid" ]; then continue; fi
+
+        if ! is_gaming_process "$pid"; then continue; fi
 
         local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
         [ -z "$raw_current_affinity" ] && continue
@@ -209,8 +271,6 @@ run_optimization() {
             fi
 
             local proc_comm=$(ps -p "$pid" -o comm=)
-            [[ "$proc_comm" == "Xorg" || "$proc_comm" == "gnome-shell" || "$proc_comm" == "kwin_wayland" ]] && continue
-
             local full_proc_cmd=$(ps -fp "$pid" -o args= | tail -n 1)
             [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
