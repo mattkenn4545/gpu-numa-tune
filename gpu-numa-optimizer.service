@@ -1,0 +1,15 @@
+[Unit]
+Description=GPU NUMA Node Affinity Optimizer
+After=network.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+# Adjust flags here: -d for daemon, -p if you want physical cores only
+# If you have multiple GPUs and want a specific one, add the index (e.g., 0)
+ExecStart=/usr/local/bin/gpu_optimize.sh -d
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
