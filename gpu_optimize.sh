@@ -11,6 +11,8 @@ DaemonMode=false
 SleepInterval=10
 StrictMem=false
 OnlyGaming=true
+SkipSystemTune=false
+DropPrivs=true
 
 # Save original arguments for re-execution after privilege dropping
 OriginalArgs=("$@")
@@ -57,6 +59,8 @@ usage() {
     echo "  -d, --daemon         Run in daemon mode (check every $SleepInterval seconds)"
     echo "  -s, --strict         Strict memory policy (OOM risk, but guaranteed local memory)"
     echo "  -a, --all-gpu-procs  Optimize ALL processes using the GPU (not just games)"
+    echo "  -n, --no-tune        Skip system-level tuning (sysctl, etc.)"
+    echo "  -k, --no-drop        Keep root privileges (do not drop to user)"
     echo "  -h, --help           Show this help message"
     echo
     echo "Arguments:"
@@ -106,10 +110,13 @@ log() {
     fi
 }
 
+echo "--------------------------------------------------------"
+
 # --- Root Check & Validated System Tuning ---
 system_tune() {
+    [ "$SkipSystemTune" = true ] && return
+
     if [ "$EUID" -eq 0 ]; then
-        echo "--------------------------------------------------------"
         echo "--> Root detected. Validating and applying optimizations..."
 
         set_sysctl() {
@@ -158,6 +165,8 @@ while [[ "$1" =~ ^- ]]; do
         -d|--daemon) DaemonMode=true; shift ;;
         -s|--strict) StrictMem=true; shift ;;
         -a|--all-gpu-procs) OnlyGaming=false; shift ;;
+        -n|--no-tune) SkipSystemTune=true; shift ;;
+        -k|--no-drop) DropPrivs=false; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1" ; usage ;;
     esac
@@ -167,11 +176,12 @@ check_dependencies
 system_tune
 detect_target_user
 
-# Drop privileges if a target user was detected and we are root
-if [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
+# Drop privileges if a target user was detected, we are root, and dropping is enabled
+if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
     echo "--> Dropping privileges to $TargetUser..."
     # Prepare the command to re-execute itself as the target user
-    exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "${OriginalArgs[@]}"
+    # We add --no-tune and --no-drop to avoid re-running system tuning and re-attempting priv drop
+    exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "${OriginalArgs[@]}"
 fi
 
 # 2. Identify GPUs (NVIDIA, AMD, Intel)
@@ -268,9 +278,9 @@ echo "CPU TARGETS      : $final_cpu_mask"
 echo "MEM POLICY       : $mem_policy_label"
 echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
 echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
-echo "--------------------------------------------------------"
-printf "%-8s | %-15s | %-25s | %s\n" "PID" "EXE" "STATUS" "COMMAND"
-echo "--------------------------------------------------------"
+echo "------------------------------------------------------------------------------------------------"
+printf "%-8s | %-15s | %-18s | %-25s | %s\n" "PID" "EXE" "ORIG. AFFINITY" "STATUS" "COMMAND"
+echo "------------------------------------------------------------------------------------------------"
 
 is_gaming_process() {
     local pid="$1"
@@ -383,7 +393,7 @@ run_optimization() {
                 numad -x "$pid" > /dev/null 2>&1
             fi
 
-            printf "%-8s | %-15s | %-25s | %s\n" "$pid" "$proc_comm" "$status_msg" "$full_proc_cmd"
+            printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
         fi
     done
 }
@@ -396,6 +406,6 @@ if [ "$DaemonMode" = true ]; then
     done
 else
     run_optimization
-    echo "--------------------------------------------------------"
+    echo "------------------------------------------------------------------------------------------------"
     echo "Optimization complete."
 fi
