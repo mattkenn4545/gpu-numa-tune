@@ -368,14 +368,14 @@ run_optimization() {
                 if migratepages "$pid" all "$numa_node_id" > /dev/null 2>&1; then
                     status_msg="OPTIMIZED & MOVED"
                     node_free_kb=$((node_free_kb - process_rss_kb))
-                    notify_user "$proc_comm(PID: $pid): Optimized" "$simplified_cmd\n\nCPU affinity set and memory moved to NUMA node $numa_node_id" "dialog-information"
+                    notify_user "$proc_comm(PID: $pid): Optimized (Node $numa_node_id)" "$simplified_cmd\n\nCPU affinity set and memory migrated" "dialog-information"
                 else
                     status_msg="OPTIMIZED (MOVE FAILED)"
-                    notify_user "$proc_comm(PID: $pid): Migration Failed" "$simplified_cmd\n\nCPU affinity set, but memory migration failed" "dialog-warning"
+                    notify_user "$proc_comm(PID: $pid): Migration Failed (Node $numa_node_id)" "$simplified_cmd\n\nCPU affinity set, but memory migration failed" "dialog-warning"
                 fi
             else
                 status_msg="OPTIMIZED (NODE FULL)"
-                notify_user "$proc_comm(PID: $pid): Node Full" "$simplified_cmd\n\nCPU affinity set, but NUMA node $numa_node_id is full" "dialog-warning"
+                notify_user "$proc_comm(PID: $pid): Node $numa_node_id Full " "$simplified_cmd\n\nCPU affinity set, but NUMA node is full" "dialog-warning"
             fi
 
             printf "%-8s | %-15s | %-25s | %s\n" "$pid" "$proc_comm" "$status_msg" "$full_proc_cmd"
