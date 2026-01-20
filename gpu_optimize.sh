@@ -137,15 +137,10 @@ system_tune() {
         set_sysctl "kernel.sched_migration_cost_ns" "5000000" "Scheduler"
         set_sysctl "net.core.netdev_max_backlog" "5000" "Network"
 
-        # Check for numad daemon
-        if ! command -v numad >/dev/null 2>&1; then
-            echo "  [INFO] numad is not installed. Consider installing it for better NUMA resource management."
-            echo "         (e.g., 'sudo apt install numad' or 'sudo dnf install numad')"
-        elif ! pgrep -x numad >/dev/null 2>&1; then
-            echo "  [INFO] numad is installed but not running. Consider starting it:"
-            echo "         'sudo systemctl start numad'"
-        else
-            echo "  [OK] numad daemon is running."
+        if pgrep -x numad >/dev/null 2>&1; then
+            echo "  [WARNING] numad daemon is running. This may contend with manual optimization."
+            echo "            Consider stopping it: 'sudo systemctl stop numad'"
+            echo "            Or uninstalling it: 'sudo apt remove numad' or 'sudo dnf remove numad'"
         fi
 
         echo "--> System tuning complete."
@@ -386,11 +381,6 @@ run_optimization() {
             else
                 status_msg="OPTIMIZED (NODE FULL)"
                 notify_user "$proc_comm(PID: $pid): Node $numa_node_id Full " "$simplified_cmd\n\nCPU affinity set, but NUMA node is full" "dialog-warning"
-            fi
-
-            if [ "$HintNumad" = true ] && command -v numad >/dev/null 2>&1; then
-                # Hint numad to exclude this PID as we've already optimized it
-                numad -x "$pid" > /dev/null 2>&1
             fi
 
             printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
