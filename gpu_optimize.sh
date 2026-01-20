@@ -64,9 +64,21 @@ system_tune() {
         }
 
         set_sysctl "vm.max_map_count" "2147483647" "Memory Mapping"
+        set_sysctl "kernel.numa_balancing" "0" "NUMA Contention"
         set_sysctl "kernel.split_lock_mitigate" "0" "Execution Latency"
         set_sysctl "kernel.sched_migration_cost_ns" "5000000" "Scheduler"
         set_sysctl "net.core.netdev_max_backlog" "5000" "Network"
+
+        # Check for numad daemon
+        if ! command -v numad >/dev/null 2>&1; then
+            echo "  [INFO] numad is not installed. Consider installing it for better NUMA resource management."
+            echo "         (e.g., 'sudo apt install numad' or 'sudo dnf install numad')"
+        elif ! pgrep -x numad >/dev/null 2>&1; then
+            echo "  [INFO] numad is installed but not running. Consider starting it:"
+            echo "         'sudo systemctl start numad'"
+        else
+            echo "  [OK] numad daemon is running."
+        fi
 
         echo "--> System tuning complete."
         echo "--------------------------------------------------------"
