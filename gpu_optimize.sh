@@ -328,7 +328,7 @@ if [ "$numa_node_id" -ge 0 ]; then
     fi
 fi
 
-echo "CPU TARGETS      : $final_cpu_mask"
+echo "CPU TARGETS      : $( [ "$UseHt" = true ] && echo "HT Allowed" || echo "Physical Only" ) ($final_cpu_mask)"
 echo "MEM POLICY       : $mem_policy_label"
 echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
 echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
