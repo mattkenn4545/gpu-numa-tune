@@ -11,6 +11,7 @@ DaemonMode=false
 SleepInterval=10
 StrictMem=false
 IncludeNearby=true
+MaxDist=11
 OnlyGaming=true
 SkipSystemTune=false
 DropPrivs=true
@@ -119,7 +120,7 @@ system_tune() {
     [ "$SkipSystemTune" = true ] && return
 
     if [ "$EUID" -eq 0 ]; then
-        echo "--> Root detected. Validating and applying optimizations..."
+        echo "--> Root detected. Applying system-wide optimizations..."
 
         set_sysctl() {
             local key="$1"
@@ -215,7 +216,6 @@ raw_cpu_list=$(cat "$device_sys_dir/local_cpulist" 2>/dev/null || echo "")
 
 get_nearby_nodes() {
     local target_node=$1
-    local max_dist=11
     local nearby=()
 
     if [ "$target_node" -lt 0 ]; then
@@ -229,7 +229,7 @@ get_nearby_nodes() {
         if [ -n "$distances" ]; then
             local i=0
             while read -r dist; do
-                if [ "$dist" -le "$max_dist" ]; then
+                if [ "$dist" -le "$MaxDist" ]; then
                     nearby+=("$i")
                 fi
                 ((i++))
@@ -313,26 +313,22 @@ target_normalized_mask=$(normalize_affinity "$final_cpu_mask")
 mem_policy_label=$([ "$StrictMem" = true ] && echo "Strict (OOM Risk)" || echo "Preferred (Safe)")
 
 # --- Startup Output ---
-echo "OPTIMIZING GPU   : $pci_addr"
-echo "MODEL            :$(lspci -s "$pci_addr" | cut -d: -f3)"
-echo "NUMA NODE        : $numa_node_id"
+echo "GPU MODEL        :$(lspci -s "$pci_addr" | cut -d: -f3) ($pci_addr)"
 
-    if [ "$numa_node_id" -ge 0 ]; then
-        if [ -n "$nearby_node_ids" ]; then
-             IFS=',' read -ra nodes <<< "$nearby_node_ids"
-             for node in "${nodes[@]}"; do
-                 echo "NODE $node SIZE      : $(get_node_total_mb "$node") MB"
-                 echo "NODE $node USED      : $(get_node_used_mb "$node") MB"
-                 echo "NODE $node FREE      : $(( $(get_node_free_kb "$node") / 1024 )) MB"
-             done
-        else
-            echo "NUMA NODE SIZE   : $(get_node_total_mb "$numa_node_id") MB"
-            echo "NUMA NODE USED   : $(get_node_used_mb "$numa_node_id") MB"
-        fi
+if [ "$numa_node_id" -ge 0 ]; then
+    if [ -n "$nearby_node_ids" ]; then
+        echo "NUMA NODES       : $nearby_node_ids (Nearby Max Distance $MaxDist)"
+        IFS=',' read -ra nodes <<< "$nearby_node_ids"
+        for node in "${nodes[@]}"; do
+           echo "NODE $node SIZE      : $(get_node_total_mb "$node") MB"
+        done
+    else
+        echo "NUMA NODE        : $numa_node_id"
+        echo "NUMA NODE SIZE   : $(get_node_total_mb "$numa_node_id") MB"
     fi
+fi
 
 echo "CPU TARGETS      : $final_cpu_mask"
-echo "NEARBY NODES     : $( [ "$IncludeNearby" = true ] && [ "$nearby_node_ids" != "$numa_node_id" ] && echo "Enabled ($nearby_node_ids)" || echo "Disabled" )"
 echo "MEM POLICY       : $mem_policy_label"
 echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
 echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
@@ -449,14 +445,14 @@ run_optimization() {
             if [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
                 if migratepages "$pid" all "${nearby_node_ids:-$numa_node_id}" > /dev/null 2>&1; then
                     status_msg="OPTIMIZED & MOVED"
-                    notify_user "$proc_comm(PID: $pid): Optimized (Nodes $nearby_node_ids)" "$simplified_cmd\n\nCPU affinity set and memory migrated to Nodes $nearby_node_ids" "dialog-information"
+                    notify_user "$proc_comm (PID: $pid): Optimized " "$simplified_cmd\n\nCPU affinity set and memory migrated to Nodes $nearby_node_ids" "dialog-information"
                 else
                     status_msg="OPTIMIZED (MOVE FAILED)"
-                    notify_user "$proc_comm(PID: $pid): Migration Failed (Nodes $nearby_node_ids)" "$simplified_cmd\n\nCPU affinity set, but memory migration to Nodes $nearby_node_ids failed" "dialog-warning"
+                    notify_user "$proc_comm (PID: $pid): Migration Failed " "$simplified_cmd\n\nCPU affinity set, but memory migration to Nodes $nearby_node_ids failed" "dialog-warning"
                 fi
             else
                 status_msg="OPTIMIZED (NODE FULL)"
-                notify_user "$proc_comm(PID: $pid): Nodes $nearby_node_ids Full " "$simplified_cmd\n\nCPU affinity set, but target NUMA nodes $nearby_node_ids are full" "dialog-warning"
+                notify_user "$proc_comm (PID: $pid): Nodes Full " "$simplified_cmd\n\nCPU affinity set, but target NUMA nodes $nearby_node_ids are full" "dialog-warning"
             fi
 
             printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
