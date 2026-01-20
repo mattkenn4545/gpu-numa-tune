@@ -12,6 +12,40 @@ SleepInterval=10
 StrictMem=false
 OnlyGaming=true
 
+# Detected User (for privilege dropping)
+TargetUser=""
+TargetUid=""
+TargetGid=""
+
+detect_target_user() {
+    # Try to find the user running the graphical session
+    local detected_user=""
+    local user_list=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | sort -u)
+
+    for u in $user_list; do
+        local sids=$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$u" '$3==u {print $1}')
+        for sid in $sids; do
+            local type=$(loginctl show-session "$sid" -p Type --value 2>/dev/null)
+            local state=$(loginctl show-session "$sid" -p State --value 2>/dev/null)
+            if [[ "$type" =~ ^(x11|wayland)$ ]] && [ "$state" = "active" ]; then
+                detected_user="$u"
+                break 2
+            fi
+        done
+    done
+
+    # Fallbacks
+    [ -z "$detected_user" ] && detected_user=$(who | awk '($2 ~ /:[0-9]/) {print $1; exit}')
+    [ -z "$detected_user" ] && detected_user="$SUDO_USER"
+    [ -z "$detected_user" ] && [ "$EUID" -ne 0 ] && detected_user="$USER"
+
+    if [ -n "$detected_user" ] && [ "$detected_user" != "root" ]; then
+        TargetUser="$detected_user"
+        TargetUid=$(id -u "$TargetUser")
+        TargetGid=$(id -g "$TargetUser")
+    fi
+}
+
 usage() {
     echo "Usage: $0 [options] [gpu_index]"
     echo
@@ -28,13 +62,37 @@ usage() {
 }
 
 check_dependencies() {
-    local deps=("lspci" "fuser" "taskset" "numactl" "migratepages" "awk" "ps")
+    local deps=("lspci" "fuser" "taskset" "numactl" "migratepages" "awk" "ps" "notify-send" "setpriv")
+    # Added /usr/sbin to path for setpriv and other system tools
+    PATH="$PATH:/usr/sbin:/sbin"
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
-            echo "Error: Required command '$cmd' not found."
-            exit 1
+            if [ "$cmd" = "notify-send" ] || [ "$cmd" = "setpriv" ]; then
+                echo "Warning: '$cmd' not found. Desktop notifications or privilege dropping may be limited."
+            else
+                echo "Error: Required command '$cmd' not found."
+                exit 1
+            fi
         fi
     done
+}
+
+notify_user() {
+    local title="$1"
+    local message="$2"
+    local icon="${3:-dialog-information}"
+
+    if command -v notify-send >/dev/null 2>&1; then
+        # We assume we are now running as the target user (or root if none detected)
+        # We still ensure DBUS and XDG vars are set for notify-send to work in a daemon context
+        if [ -n "$TargetUid" ]; then
+            env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$TargetUid/bus" \
+                XDG_RUNTIME_DIR="/run/user/$TargetUid" \
+                notify-send -a "GPU NUMA Optimizer" -i "$icon" "$title" "$message" >/dev/null 2>&1
+        else
+            notify-send -a "GPU NUMA Optimizer" -i "$icon" "$title" "$message" >/dev/null 2>&1
+        fi
+    fi
 }
 
 log() {
@@ -104,6 +162,14 @@ done
 
 check_dependencies
 system_tune
+detect_target_user
+
+# Drop privileges if a target user was detected and we are root
+if [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
+    echo "--> Dropping privileges to $TargetUser..."
+    # Prepare the command to re-execute itself as the target user
+    exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "$@"
+fi
 
 # 2. Identify GPUs (NVIDIA, AMD, Intel)
 mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
@@ -254,7 +320,12 @@ run_optimization() {
     for pid in $gpu_pids; do
         [[ -z "$pid" ]] && continue
         if [ "$pid" -lt 100 ] || [ ! -d "/proc/$pid" ]; then continue; fi
-        if [ "$EUID" -ne 0 ] && [ ! -O "/proc/$pid" ]; then continue; fi
+        # If we are not root, we can only optimize processes we own
+        if [ "$EUID" -ne 0 ] && [ ! -O "/proc/$pid" ]; then
+            # We skip with a log if it's potentially a game but we don't own it
+            # but only if OnlyGaming is true, otherwise it's expected
+            continue
+        fi
 
         if ! is_gaming_process "$pid"; then continue; fi
 
@@ -274,17 +345,24 @@ run_optimization() {
             local process_rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
             local safety_margin_kb=524288
 
-            if [ "$node_free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
-                migratepages "$pid" all "$numa_node_id" > /dev/null 2>&1
-                status_msg="OPTIMIZED & MOVED"
-                node_free_kb=$((node_free_kb - process_rss_kb))
-            else
-                status_msg="OPTIMIZED (NODE FULL)"
-            fi
-
             local proc_comm=$(ps -p "$pid" -o comm=)
+
             local full_proc_cmd=$(ps -fp "$pid" -o args= | tail -n 1)
             [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
+
+            if [ "$node_free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
+                if migratepages "$pid" all "$numa_node_id" > /dev/null 2>&1; then
+                    status_msg="OPTIMIZED & MOVED"
+                    node_free_kb=$((node_free_kb - process_rss_kb))
+                    notify_user "$proc_comm: Optimized" "$full_proc_cmd\n\nCPU affinity set and memory moved to NUMA node $numa_node_id (PID: $pid)" "dialog-information"
+                else
+                    status_msg="OPTIMIZED (MOVE FAILED)"
+                    notify_user "$proc_comm: Migration Failed" "$full_proc_cmd\n\nCPU affinity set, but memory migration failed (PID: $pid)" "dialog-warning"
+                fi
+            else
+                status_msg="OPTIMIZED (NODE FULL)"
+                notify_user "$proc_comm: Node Full" "$full_proc_cmd\n\nCPU affinity set, but NUMA node $numa_node_id is full (PID: $pid)" "dialog-warning"
+            fi
 
             printf "%-8s | %-15s | %-25s | %s\n" "$pid" "$proc_comm" "$status_msg" "$full_proc_cmd"
         fi
