@@ -12,6 +12,9 @@ SleepInterval=10
 StrictMem=false
 OnlyGaming=true
 
+# Save original arguments for re-execution after privilege dropping
+OriginalArgs=("$@")
+
 # Detected User (for privilege dropping)
 TargetUser=""
 TargetUid=""
@@ -168,7 +171,7 @@ detect_target_user
 if [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
     echo "--> Dropping privileges to $TargetUser..."
     # Prepare the command to re-execute itself as the target user
-    exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "$@"
+    exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "${OriginalArgs[@]}"
 fi
 
 # 2. Identify GPUs (NVIDIA, AMD, Intel)
