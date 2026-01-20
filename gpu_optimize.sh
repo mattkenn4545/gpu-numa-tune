@@ -378,6 +378,11 @@ run_optimization() {
                 notify_user "$proc_comm(PID: $pid): Node $numa_node_id Full " "$simplified_cmd\n\nCPU affinity set, but NUMA node is full" "dialog-warning"
             fi
 
+            if [ "$HintNumad" = true ] && command -v numad >/dev/null 2>&1; then
+                # Hint numad to exclude this PID as we've already optimized it
+                numad -x "$pid" > /dev/null 2>&1
+            fi
+
             printf "%-8s | %-15s | %-25s | %s\n" "$pid" "$proc_comm" "$status_msg" "$full_proc_cmd"
         fi
     done
