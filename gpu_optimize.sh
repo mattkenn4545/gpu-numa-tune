@@ -353,18 +353,29 @@ run_optimization() {
             local full_proc_cmd=$(ps -fp "$pid" -o args= | tail -n 1)
             [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
+            # Extract the executable name (head of the command) for cleaner notifications
+            # We handle Windows paths and potential spaces in the executable path (common in Steam/Proton)
+            local simplified_cmd=""
+            if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
+                # For Windows executables, take everything up to .exe
+                simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
+            else
+                # For Linux, take the first word and get its basename
+                simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
+            fi
+
             if [ "$node_free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
                 if migratepages "$pid" all "$numa_node_id" > /dev/null 2>&1; then
                     status_msg="OPTIMIZED & MOVED"
                     node_free_kb=$((node_free_kb - process_rss_kb))
-                    notify_user "$proc_comm: Optimized" "$full_proc_cmd\n\nCPU affinity set and memory moved to NUMA node $numa_node_id (PID: $pid)" "dialog-information"
+                    notify_user "$proc_comm(PID: $pid): Optimized" "$simplified_cmd\n\nCPU affinity set and memory moved to NUMA node $numa_node_id" "dialog-information"
                 else
                     status_msg="OPTIMIZED (MOVE FAILED)"
-                    notify_user "$proc_comm: Migration Failed" "$full_proc_cmd\n\nCPU affinity set, but memory migration failed (PID: $pid)" "dialog-warning"
+                    notify_user "$proc_comm(PID: $pid): Migration Failed" "$simplified_cmd\n\nCPU affinity set, but memory migration failed" "dialog-warning"
                 fi
             else
                 status_msg="OPTIMIZED (NODE FULL)"
-                notify_user "$proc_comm: Node Full" "$full_proc_cmd\n\nCPU affinity set, but NUMA node $numa_node_id is full (PID: $pid)" "dialog-warning"
+                notify_user "$proc_comm(PID: $pid): Node Full" "$simplified_cmd\n\nCPU affinity set, but NUMA node $numa_node_id is full" "dialog-warning"
             fi
 
             printf "%-8s | %-15s | %-25s | %s\n" "$pid" "$proc_comm" "$status_msg" "$full_proc_cmd"
