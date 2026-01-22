@@ -12,7 +12,7 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 
 - **🎯 Precision Pinning:** Automatically detects your GPU's physical NUMA node and pins game threads to the most efficient CPU cores.
 - **🧠 Intelligent Memory Migration:** Moves existing game memory allocations to the GPU's local NUMA node in real-time.
-- **🕹️ Gaming-Aware Heuristics:** Automatically identifies games from Steam, Proton, Wine, Lutris, and Heroic while ignoring background apps like browsers or Discord.
+- **🕹️ Gaming-Aware Heuristics:** Automatically identifies games from Steam, Proton, Wine, Lutris, and Heroic by inspecting environment variables and process ancestry, while ignoring background apps like browsers or Discord.
 - **⚡ System-Level Tuning:** Optimizes kernel parameters (`sysctl`) for reduced scheduling latency and improved memory mapping.
 - **🛡️ Cross-Vendor Support:** Seamlessly works with NVIDIA, AMD, and Intel GPUs.
 - **🔄 Smart Daemon Mode:** Silently monitors your system, optimizing new games as they launch and providing periodic status summaries.
@@ -109,9 +109,11 @@ To ensure maximum performance while maintaining security, the script handles pri
 ### 5. Kernel Latency Tuning
 If run as root, the script applies several system-level tweaks to reduce micro-stutter and ensure consistent performance:
 - **`kernel.numa_balancing=0`**: Disables the kernel's automatic NUMA balancer, which can cause unpredictable "stutters" when it moves memory behind the game's back.
-- **`vm.max_map_count`**: Increased to handle the heavy memory mapping requirements of modern AAA titles and Wine/Proton.
-- **`kernel.sched_migration_cost_ns`**: Tuned to reduce unnecessary task migrations between cores.
-- **`net.core.busy_read/poll`**: Low-latency network polling for smoother online play.
+- **`kernel.split_lock_mitigate=0`**: Disables split lock mitigation to prevent execution stalls in certain applications.
+- **`vm.max_map_count`**: Increased to `2147483647` to handle the heavy memory mapping requirements of modern AAA titles and Wine/Proton.
+- **`kernel.sched_migration_cost_ns`**: Tuned to `5000000` (5ms) to reduce unnecessary task migrations between cores.
+- **`net.core.netdev_max_backlog`**: Increased network receive queue to `5000` to prevent packet drops during heavy load.
+- **`net.core.busy_read/poll`**: Set to `50` for low-latency network polling for smoother online play.
 - **`vm.stat_interval=10`**: Reduces background jitter by decreasing the frequency of virtual memory statistics collection.
 - **`kernel.nmi_watchdog=0`**: Disables the NMI watchdog to reduce periodic interrupts and improve latency consistency.
 - **Transparent Hugepages (THP)**: Set to `never` to prevent micro-stutters and stalls during dynamic allocation and defragmentation.
