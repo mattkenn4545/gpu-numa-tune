@@ -1,44 +1,60 @@
 #!/bin/bash
 
 # ==============================================================================
-# GPU NUMA Optimizer - Cross-Vendor Version (NVIDIA/AMD/Intel)
-# Optimizes gaming performance via CPU pinning, memory migration, and sysctl.
+# GPU NUMA Optimizer
+# ==============================================================================
+# Purpose:
+#   Optimizes gaming and high-performance application performance by aligning 
+#   processes with the system's NUMA (Non-Uniform Memory Access) topology.
+#
+# Mechanism:
+#   1. Detects the NUMA node closest to a specified GPU (default: index 0).
+#   2. Optionally identifies "nearby" NUMA nodes based on hardware distance.
+#   3. Tunes system parameters (sysctl, THP, CPU governors) for low latency.
+#   4. Monitors for processes using the GPU (render nodes/NVIDIA devices).
+#   5. Applies CPU affinity (pinning) and memory policies (membind/preferred)
+#      to ensure the process runs on the optimal CPU cores and memory nodes.
+#   6. Migrates existing memory pages to the target nodes.
+#
+# Requirements:
+#   - Linux with NUMA support
+#   - Utilities: lspci, fuser, taskset, numactl, migratepages, setpriv
+#
+# Usage:
+#   sudo ./gpu_optimize.sh [options] [gpu_index]
 # ==============================================================================
 
-# --- Global Configuration ---
-UseHt=true
-DaemonMode=false
-SleepInterval=10
-StrictMem=false
-IncludeNearby=true
-MaxDist=11
-OnlyGaming=true
-SkipSystemTune=false
-DropPrivs=true
+# --- Configuration ---
+UseHt=true              # Use SMT/HT sibling cores
+DaemonMode=false        # Run continuously
+SleepInterval=10        # Seconds between checks in daemon mode
+StrictMem=false         # true = membind (OOM risk), false = preferred
+IncludeNearby=true      # Include NUMA nodes within MaxDist
+MaxDist=11              # Max distance for "nearby" nodes
+OnlyGaming=true         # Filter for gaming-related processes
+SkipSystemTune=false    # Skip sysctl and governor changes
+DropPrivs=true          # Drop root to user after system tuning
 
-# Tracking for optimized processes
+# State Tracking
 declare -A OptimizedPidsMap
 TotalOptimizedCount=0
 LastSummaryTime=$(date +%s)
-SummaryInterval=600 # 10 minutes
-LogLineCount=9999
+SummaryInterval=600     # Periodic summary interval (seconds)
+LogLineCount=9999       # Force header on first log
 HeaderInterval=20
 
-# Buffer for pending notifications to avoid spam
+# Notification Buffer
 declare -a PendingOptimizations
 
-# Save original arguments for re-execution after privilege dropping
+# Process Environment
 OriginalArgs=("$@")
-
-# Detected User (for privilege dropping)
 TargetUser=""
 TargetUid=""
 TargetGid=""
 
-# Functions
-
 # --- Utilities & Logging ---
 
+# Displays a formatted table row for process optimization status
 status_log() {
     local pid="$1"
     local exe="$2"
@@ -60,6 +76,7 @@ status_log() {
     ((LogLineCount++))
 }
 
+# Logs messages to syslog in daemon mode, or stdout otherwise
 log() {
     if [ "$DaemonMode" = true ]; then
         logger -t gpu-numa-tune "$1"
@@ -86,14 +103,14 @@ usage() {
     exit 0
 }
 
+# Send desktop notification using notify-send
 notify_user() {
     local title="$1"
     local message="$2"
     local icon="${3:-dialog-information}"
 
     if command -v notify-send >/dev/null 2>&1; then
-        # We assume we are now running as the target user (or root if none detected)
-        # We still ensure DBUS and XDG vars are set for notify-send to work in a daemon context
+        # Ensure DBUS and XDG vars are set for notify-send to work in a daemon context
         if [ -n "$TargetUid" ]; then
             env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$TargetUid/bus" \
                 XDG_RUNTIME_DIR="/run/user/$TargetUid" \
@@ -104,15 +121,13 @@ notify_user() {
     fi
 }
 
+# Processes and displays queued notifications
 flush_notifications() {
     [ ${#PendingOptimizations[@]} -eq 0 ] && return
 
-    # Sort pending optimizations by RSS size (last field) descending
-    # We use a temporary array to store sorted results
+    # Sort pending optimizations by RSS size descending
     local sorted_pending=()
     if [ ${#PendingOptimizations[@]} -gt 1 ]; then
-        # Use printf to handle potential spaces and pipe to sort
-        # Fields: pid|comm|simplified|status|nodes|rss
         local IFS_BACKUP=$IFS
         IFS=$'\n'
         # shellcheck disable=SC2207
@@ -157,6 +172,7 @@ flush_notifications() {
 
 # --- System Discovery & Hardware Info ---
 
+# Identifies the GPU's PCI address based on the provided index
 detect_gpu() {
     mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
     GpuIndexArg=${GpuIndexArg:-0}
@@ -179,6 +195,7 @@ detect_gpu() {
     fi
 }
 
+# Determines NUMA nodes and CPU list associated with the GPU
 discover_resources() {
     local device_sys_dir="/sys/bus/pci/devices/$PciAddr"
     if [ ! -d "$device_sys_dir" ]; then
@@ -204,6 +221,7 @@ discover_resources() {
     fi
 }
 
+# Returns a comma-separated list of NUMA nodes within MaxDist of the target node
 get_nearby_nodes() {
     local target_node=$1
     local nearby=()
@@ -213,7 +231,6 @@ get_nearby_nodes() {
         return
     fi
 
-    # Use numactl to get distances if available
     if command -v numactl >/dev/null 2>&1; then
         local distances=$(numactl --hardware | awk -v node="$target_node" '$1 == node":" {for(i=2; i<=NF; i++) print $i}')
         if [ -n "$distances" ]; then
@@ -229,10 +246,10 @@ get_nearby_nodes() {
         fi
     fi
 
-    # Fallback to just the target node
     echo "$target_node"
 }
 
+# Combines CPU lists from multiple NUMA nodes
 get_nodes_cpulist() {
     local nodes=$1
     local combined=""
@@ -293,6 +310,7 @@ detect_target_user() {
 
 # --- CPU & Affinity Management ---
 
+# Converts CPU list (e.g., 0-3,6) to a sorted, unique, comma-separated list
 normalize_affinity() {
     # shellcheck disable=SC2162
     echo "$1" | tr ',' '\n' | while read r; do
@@ -301,6 +319,7 @@ normalize_affinity() {
     done | sort -n | tr '\n' ',' | sed 's/,$//'
 }
 
+# Filters the CPU list based on UseHt configuration
 filter_cpus() {
     FinalCpuMask=""
     if [ "$UseHt" = true ]; then
@@ -328,13 +347,13 @@ filter_cpus() {
 
 # --- Process Analysis & Filtering ---
 
+# Determines if a PID should be optimized based on its environment and command line
 is_gaming_process() {
     local pid="$1"
 
-    # If OnlyGaming is false, we can optimize anything that uses the GPU
     [ "$OnlyGaming" = false ] && return 0
 
-    # 1. Known Blacklist (Non-gaming GPU heavy apps)
+    # 1. Known Blacklist
     local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
     case "$proc_comm" in
         Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) return 1 ;;
@@ -342,26 +361,25 @@ is_gaming_process() {
         steamwebhelper|Discord|slack|teams|obs|obs64|heroic) return 1 ;;
     esac
 
-    # 2. Heuristics (Exclude Electron/Chrome-based UI processes like Heroic or Steam's web helper)
+    # 2. UI/Utility Heuristics
     local proc_args=$(ps -fp "$pid" -o args= 2>/dev/null)
     if echo "$proc_args" | grep -qE -- "--type=(zygote|renderer|gpu-process|utility)"; then
         return 1
     fi
 
-    # 3. Gaming Environment Variables
+    # 3. Environment Variable Markers (Steam, Proton, Lutris, etc.)
     if [ -r "/proc/$pid/environ" ]; then
-        # Check for Steam, Proton, Lutris, Heroic markers
         if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qE "^(STEAM_COMPAT_APP_ID|STEAM_GAME_ID|LUTRIS_GAME_ID|HEROIC_APP_NAME|PROTON_VER|WINEPREFIX)="; then
             return 0
         fi
     fi
 
-    # 4. Heuristics (Wine/Proton processes, Game executables)
+    # 4. Binary Name Heuristics
     if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer"; then
         return 0
     fi
 
-    # 5. Check Parent Processes (up to 3 levels)
+    # 5. Parent Process Check
     local ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
     for i in {1..3}; do
         [ -z "$ppid" ] || [ "$ppid" -lt 10 ] && break
@@ -377,6 +395,7 @@ is_gaming_process() {
 
 # --- System Optimization & Tuning ---
 
+# Applies system-wide low-latency and NUMA-related optimizations (requires root)
 system_tune() {
     [ "$SkipSystemTune" = true ] && return
 
@@ -405,8 +424,7 @@ system_tune() {
         set_sysctl "vm.stat_interval" "10" "Jitter Reduction"
         set_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
 
-        # --- Transparency Hugepages (THP) ---
-        # THP can cause micro-stutters during allocation. 'madvise' or 'never' is often better for gaming.
+        # Transparency Hugepages (THP): 'never' or 'madvise' reduces micro-stutters in games
         if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
             echo "never" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
             printf "  [OK] %-30s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
@@ -416,9 +434,7 @@ system_tune() {
             printf "  [OK] %-30s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
         fi
 
-        # --- CPU Scaling Governor ---
-        # Set performance governor for all CPUs. While we ideally only target CPUs on the GPU's NUMA node,
-        # we do this at the system level here because it's a one-time pre-priv-drop optimization.
+        # CPU Scaling Governor: Set to 'performance' for all cores
         if [ -d /sys/devices/system/cpu/cpufreq ]; then
             for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
                 [ -f "$gov" ] && echo "performance" > "$gov" 2>/dev/null
@@ -429,7 +445,6 @@ system_tune() {
         if pgrep -x numad >/dev/null 2>&1; then
             echo "  [WARNING] numad daemon is running. This may contend with manual optimization."
             echo "            Consider stopping it: 'sudo systemctl stop numad'"
-            echo "            Or uninstalling it: 'sudo apt remove numad' or 'sudo dnf remove numad'"
         fi
 
         echo "--> System tuning complete."
@@ -444,6 +459,7 @@ system_tune() {
 
 # --- Core Logic & Execution ---
 
+# Main optimization loop: identifies GPU users and applies policies
 run_optimization() {
     # Cross-vendor PID detection (Render nodes and NVIDIA devices)
     local gpu_pids=$(fuser /dev/dri/renderD* /dev/nvidia* 2>/dev/null | tr ' ' '\n' | sort -u)
@@ -451,10 +467,9 @@ run_optimization() {
     for pid in $gpu_pids; do
         [[ -z "$pid" ]] && continue
         if [ "$pid" -lt 100 ] || [ ! -d "/proc/$pid" ]; then continue; fi
-        # If we are not root, we can only optimize processes we own
+        
+        # Only optimize processes owned by the current user (unless root)
         if [ "$EUID" -ne 0 ] && [ ! -O "/proc/$pid" ]; then
-            # We skip with a log if it's potentially a game but we don't own it
-            # but only if OnlyGaming is true, otherwise it's expected
             continue
         fi
 
@@ -473,7 +488,7 @@ run_optimization() {
             if [ "$StrictMem" = true ]; then
                 numactl --membind="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
             else
-                # Try preferred-many if multiple nodes are present, fallback to preferred
+                # Preferred policy: try multiple nodes if available, fallback to single
                 if [[ "$NearbyNodeIds" == *","* ]]; then
                     if ! numactl --preferred-many="$NearbyNodeIds" -p "$pid" > /dev/null 2>&1; then
                          numactl --preferred="${NearbyNodeIds%%,*}" -p "$pid" > /dev/null 2>&1
@@ -486,14 +501,11 @@ run_optimization() {
             local process_rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
             local safety_margin_kb=524288
 
-            # Extract the executable name (head of the command) for cleaner notifications
-            # We handle Windows paths and potential spaces in the executable path (common in Steam/Proton)
+            # Extract a simplified executable name for notifications
             local simplified_cmd=""
             if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
-                # For Windows executables, take everything up to .exe
                 simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
             else
-                # For Linux, take the first word and get its basename
                 simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
             fi
 
@@ -507,6 +519,7 @@ run_optimization() {
                 free_kb=$(get_node_free_kb "$NumaNodeId")
             fi
 
+            # Migrate pages if there's enough free memory
             if [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
                 if migratepages "$pid" all "${NearbyNodeIds:-$NumaNodeId}" > /dev/null 2>&1; then
                     status_msg="OPTIMIZED & MOVED"
@@ -519,12 +532,9 @@ run_optimization() {
 
             # Queue for notification
             PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${NearbyNodeIds:-$NumaNodeId}|$process_rss_kb")
-
             status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
         else
-            # Already optimized
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
-                # If we are in startup phase or just noticed it, print it
                 status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED" "$full_proc_cmd"
             fi
         fi
@@ -536,6 +546,7 @@ run_optimization() {
     done
 }
 
+# Periodically prints a summary of optimized processes
 check_active_optimizations() {
     local now=$(date +%s)
     if [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
@@ -567,6 +578,7 @@ check_active_optimizations() {
 
 # --- CLI & Startup ---
 
+# Parses command-line arguments and sets configuration variables
 parse_args() {
     while [[ "$#" -gt 0 ]]; do
         case $1 in
@@ -584,9 +596,9 @@ parse_args() {
     done
 }
 
+# Ensures all required external utilities are installed
 check_dependencies() {
     local deps=("lspci" "fuser" "taskset" "numactl" "migratepages" "awk" "ps" "notify-send" "setpriv")
-    # Added /usr/sbin to path for setpriv and other system tools
     PATH="$PATH:/usr/sbin:/sbin"
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -600,6 +612,7 @@ check_dependencies() {
     done
 }
 
+# Prints hardware and configuration summary at startup
 print_banner() {
     local mem_policy_label=$([ "$StrictMem" = true ] && echo "Strict (OOM Risk)" || echo "Preferred (Safe)")
     
@@ -638,8 +651,7 @@ detect_target_user
 # Drop privileges if a target user was detected, we are root, and dropping is enabled
 if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
     echo "--> Dropping privileges to $TargetUser..."
-    # Prepare the command to re-execute itself as the target user
-    # We add --no-tune and --no-drop to avoid re-running system tuning and re-attempting priv drop
+    # Re-execute as the target user, skipping system-wide tuning in the child process
     exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "${OriginalArgs[@]}"
 fi
 
@@ -652,12 +664,11 @@ if [ "$DaemonMode" = true ]; then
     while true; do
         run_optimization
 
-        # If we optimized something, wait SleepInterval + 5 before notifying
-        # to catch any subsequent processes (e.g. game launcher -> game exe)
+        # Aggregate notifications to avoid spamming the user
         if [ ${#PendingOptimizations[@]} -gt 0 ]; then
             log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
             sleep $((SleepInterval + 5))
-            # Run one more time to catch immediate followers before flushing
+            # Run one more time to catch immediate followers (e.g., game launcher -> game exe)
             run_optimization
             flush_notifications
         fi
