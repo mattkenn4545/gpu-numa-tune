@@ -77,10 +77,15 @@ Once a game is identified, the script applies three distinct optimizations:
 - **Live Migration (`migratepages`)**: Moves existing memory pages from "slow" remote nodes to the "fast" local node in real-time without restarting the game.
 
 ### 4. Kernel Latency Tuning
-If run as root, the script applies several `sysctl` tweaks to reduce micro-stutter:
+If run as root, the script applies several system-level tweaks to reduce micro-stutter and ensure consistent performance:
 - **`kernel.numa_balancing=0`**: Disables the kernel's automatic NUMA balancer, which can cause unpredictable "stutters" when it moves memory behind the game's back.
 - **`vm.max_map_count`**: Increased to handle the heavy memory mapping requirements of modern AAA titles and Wine/Proton.
 - **`kernel.sched_migration_cost_ns`**: Tuned to reduce unnecessary task migrations between cores.
+- **`net.core.busy_read/poll`**: Low-latency network polling for smoother online play.
+- **`vm.stat_interval=10`**: Reduces background jitter by decreasing the frequency of virtual memory statistics collection.
+- **`kernel.nmi_watchdog=0`**: Disables the NMI watchdog to reduce periodic interrupts and improve latency consistency.
+- **Transparent Hugepages (THP)**: Set to `never` to prevent micro-stutters and stalls during dynamic allocation and defragmentation.
+- **CPU Scaling Governor**: Automatically sets all cores to `performance` mode to prevent downclocking during gameplay.
 
 ---
 

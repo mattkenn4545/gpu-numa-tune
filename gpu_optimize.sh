@@ -145,6 +145,31 @@ system_tune() {
         set_sysctl "kernel.split_lock_mitigate" "0" "Execution Latency"
         set_sysctl "kernel.sched_migration_cost_ns" "5000000" "Scheduler"
         set_sysctl "net.core.netdev_max_backlog" "5000" "Network"
+        set_sysctl "net.core.busy_read" "50" "Network Latency"
+        set_sysctl "net.core.busy_poll" "50" "Network Latency"
+        set_sysctl "vm.stat_interval" "10" "Jitter Reduction"
+        set_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
+
+        # --- Transparency Hugepages (THP) ---
+        # THP can cause micro-stutters during allocation. 'madvise' or 'never' is often better for gaming.
+        if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+            echo "never" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+            printf "  [OK] %-30s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
+        fi
+        if [ -f /sys/kernel/mm/transparent_hugepage/defrag ]; then
+            echo "never" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null
+            printf "  [OK] %-30s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
+        fi
+
+        # --- CPU Scaling Governor ---
+        # Set performance governor for all CPUs. While we ideally only target CPUs on the GPU's NUMA node,
+        # we do this at the system level here because it's a one-time pre-priv-drop optimization.
+        if [ -d /sys/devices/system/cpu/cpufreq ]; then
+            for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+                [ -f "$gov" ] && echo "performance" > "$gov" 2>/dev/null
+            done
+            printf "  [OK] %-30s -> %-10s (%s)\n" "cpu_governor" "performance" "Power/Perf"
+        fi
 
         if pgrep -x numad >/dev/null 2>&1; then
             echo "  [WARNING] numad daemon is running. This may contend with manual optimization."
