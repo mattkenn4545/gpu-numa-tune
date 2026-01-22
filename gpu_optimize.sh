@@ -21,6 +21,8 @@ declare -A OptimizedPidsMap
 TotalOptimizedCount=0
 LastSummaryTime=$(date +%s)
 SummaryInterval=600 # 10 minutes
+LogLineCount=9999
+HeaderInterval=20
 
 # Buffer for pending notifications to avoid spam
 declare -a PendingOptimizations
@@ -35,32 +37,34 @@ TargetGid=""
 
 # Functions
 
-detect_target_user() {
-    # Try to find the user running the graphical session
-    local detected_user=""
-    local user_list=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | sort -u)
+# --- Utilities & Logging ---
 
-    for u in $user_list; do
-        local sids=$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$u" '$3==u {print $1}')
-        for sid in $sids; do
-            local type=$(loginctl show-session "$sid" -p Type --value 2>/dev/null)
-            local state=$(loginctl show-session "$sid" -p State --value 2>/dev/null)
-            if [[ "$type" =~ ^(x11|wayland)$ ]] && [ "$state" = "active" ]; then
-                detected_user="$u"
-                break 2
-            fi
-        done
-    done
+status_log() {
+    local pid="$1"
+    local exe="$2"
+    local affinity="$3"
+    local status="$4"
+    local cmd="$5"
 
-    # Fallbacks
-    [ -z "$detected_user" ] && detected_user=$(who | awk '($2 ~ /:[0-9]/) {print $1; exit}')
-    [ -z "$detected_user" ] && detected_user="$SUDO_USER"
-    [ -z "$detected_user" ] && [ "$EUID" -ne 0 ] && detected_user="$USER"
+    if [ "$LogLineCount" -ge "$HeaderInterval" ]; then
+        LogLineCount=0
 
-    if [ -n "$detected_user" ] && [ "$detected_user" != "root" ]; then
-        TargetUser="$detected_user"
-        TargetUid=$(id -u "$TargetUser")
-        TargetGid=$(id -g "$TargetUser")
+        echo "------------------------------------------------------------------------------------------------"
+        status_log "PID" "EXE" "ORIG AFFINITY" "STATUS" "COMMAND"
+        echo "------------------------------------------------------------------------------------------------"
+    fi
+
+    [ -z "$pid" ] && return
+
+    printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$exe" "$affinity" "$status" "$cmd"
+    ((LogLineCount++))
+}
+
+log() {
+    if [ "$DaemonMode" = true ]; then
+        logger -t gpu-numa-tune "$1"
+    else
+        echo "$1"
     fi
 }
 
@@ -80,22 +84,6 @@ usage() {
     echo "Arguments:"
     echo "  gpu_index            Index of the GPU from lspci (default: 0)"
     exit 0
-}
-
-check_dependencies() {
-    local deps=("lspci" "fuser" "taskset" "numactl" "migratepages" "awk" "ps" "notify-send" "setpriv")
-    # Added /usr/sbin to path for setpriv and other system tools
-    PATH="$PATH:/usr/sbin:/sbin"
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            if [ "$cmd" = "notify-send" ] || [ "$cmd" = "setpriv" ]; then
-                echo "Warning: '$cmd' not found. Desktop notifications or privilege dropping may be limited."
-            else
-                echo "Error: Required command '$cmd' not found."
-                exit 1
-            fi
-        fi
-    done
 }
 
 notify_user() {
@@ -167,13 +155,227 @@ flush_notifications() {
     PendingOptimizations=()
 }
 
-log() {
-    if [ "$DaemonMode" = true ]; then
-        logger -t gpu-numa-tune "$1"
-    else
-        echo "$1"
+# --- System Discovery & Hardware Info ---
+
+detect_gpu() {
+    mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
+    GpuIndexArg=${GpuIndexArg:-0}
+
+    if [ "${#all_vga_devices[@]}" -eq 0 ]; then
+        echo "Error: No GPU (VGA/3D) devices detected via lspci."
+        exit 1
+    fi
+
+    if [ "$GpuIndexArg" -ge "${#all_vga_devices[@]}" ]; then
+        echo "Error: GPU index $GpuIndexArg not found (Found ${#all_vga_devices[@]} GPUs)."
+        exit 1
+    fi
+
+    PciAddr=$(echo "${all_vga_devices[$GpuIndexArg]}" | awk '{print $1}')
+
+    if [ -z "$PciAddr" ]; then
+        echo "Error: Could not determine PCI address for GPU index $GpuIndexArg."
+        exit 1
     fi
 }
+
+discover_resources() {
+    local device_sys_dir="/sys/bus/pci/devices/$PciAddr"
+    if [ ! -d "$device_sys_dir" ]; then
+        echo "Error: PCI device directory $device_sys_dir not found."
+        exit 1
+    fi
+
+    NumaNodeId=$(cat "$device_sys_dir/numa_node" 2>/dev/null || echo -1)
+    RawCpuList=$(cat "$device_sys_dir/local_cpulist" 2>/dev/null || echo "")
+
+    NearbyNodeIds="$NumaNodeId"
+    if [ "$IncludeNearby" = true ]; then
+        NearbyNodeIds=$(get_nearby_nodes "$NumaNodeId")
+    fi
+
+    if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "$NumaNodeId" ]; then
+        RawCpuList=$(get_nodes_cpulist "$NearbyNodeIds")
+    fi
+
+    if [ -z "$RawCpuList" ]; then
+        echo "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
+        RawCpuList=$(cat /sys/devices/system/cpu/online 2>/dev/null)
+    fi
+}
+
+get_nearby_nodes() {
+    local target_node=$1
+    local nearby=()
+
+    if [ "$target_node" -lt 0 ]; then
+        echo ""
+        return
+    fi
+
+    # Use numactl to get distances if available
+    if command -v numactl >/dev/null 2>&1; then
+        local distances=$(numactl --hardware | awk -v node="$target_node" '$1 == node":" {for(i=2; i<=NF; i++) print $i}')
+        if [ -n "$distances" ]; then
+            local i=0
+            while read -r dist; do
+                if [ "$dist" -le "$MaxDist" ]; then
+                    nearby+=("$i")
+                fi
+                ((i++))
+            done <<< "$distances"
+            echo "${nearby[*]}" | tr ' ' ','
+            return
+        fi
+    fi
+
+    # Fallback to just the target node
+    echo "$target_node"
+}
+
+get_nodes_cpulist() {
+    local nodes=$1
+    local combined=""
+    IFS=',' read -ra node_list <<< "$nodes"
+    for node in "${node_list[@]}"; do
+        local cpulist=$(cat "/sys/devices/system/node/node$node/cpulist" 2>/dev/null)
+        [ -n "$cpulist" ] && combined+="$cpulist,"
+    done
+    echo "${combined%,}"
+}
+
+get_node_free_kb() {
+    # shellcheck disable=SC2086
+    local free_kb=$(grep -i "Node $1 MemFree" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
+    echo "${free_kb:-0}"
+}
+
+get_node_total_mb() {
+    # shellcheck disable=SC2086
+    local total_kb=$(grep -i "Node $1 MemTotal" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
+    echo "$(( ${total_kb:-0} / 1024 ))"
+}
+
+get_node_used_mb() {
+    # shellcheck disable=SC2086
+    local used_kb=$(grep -i "Node $1 MemUsed" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
+    echo "$(( ${used_kb:-0} / 1024 ))"
+}
+
+detect_target_user() {
+    # Try to find the user running the graphical session
+    local detected_user=""
+    local user_list=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | sort -u)
+
+    for u in $user_list; do
+        local sids=$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$u" '$3==u {print $1}')
+        for sid in $sids; do
+            local type=$(loginctl show-session "$sid" -p Type --value 2>/dev/null)
+            local state=$(loginctl show-session "$sid" -p State --value 2>/dev/null)
+            if [[ "$type" =~ ^(x11|wayland)$ ]] && [ "$state" = "active" ]; then
+                detected_user="$u"
+                break 2
+            fi
+        done
+    done
+
+    # Fallbacks
+    [ -z "$detected_user" ] && detected_user=$(who | awk '($2 ~ /:[0-9]/) {print $1; exit}')
+    [ -z "$detected_user" ] && detected_user="$SUDO_USER"
+    [ -z "$detected_user" ] && [ "$EUID" -ne 0 ] && detected_user="$USER"
+
+    if [ -n "$detected_user" ] && [ "$detected_user" != "root" ]; then
+        TargetUser="$detected_user"
+        TargetUid=$(id -u "$TargetUser")
+        TargetGid=$(id -g "$TargetUser")
+    fi
+}
+
+# --- CPU & Affinity Management ---
+
+normalize_affinity() {
+    # shellcheck disable=SC2162
+    echo "$1" | tr ',' '\n' | while read r; do
+        # shellcheck disable=SC2086
+        if [[ $r == *-* ]]; then seq ${r%-*} ${r#*-}; else echo $r; fi
+    done | sort -n | tr '\n' ',' | sed 's/,$//'
+}
+
+filter_cpus() {
+    FinalCpuMask=""
+    if [ "$UseHt" = true ]; then
+        FinalCpuMask="$RawCpuList"
+    else
+        IFS=',' read -ra cpu_ranges <<< "$RawCpuList"
+        for range in "${cpu_ranges[@]}"; do
+            [ -z "$range" ] && continue
+            # shellcheck disable=SC2086
+            [[ $range == *-* ]] && expanded_list=$(seq ${range%-*} ${range#*-}) || expanded_list=$range
+            for cpu_id in $expanded_list; do
+                sibling_file="/sys/devices/system/cpu/cpu$cpu_id/topology/thread_siblings_list"
+                if [ -f "$sibling_file" ]; then
+                    # shellcheck disable=SC2002
+                    first_sibling=$(cat "$sibling_file" | cut -d',' -f1 | cut -d'-' -f1)
+                    [[ "$cpu_id" -eq "$first_sibling" ]] && FinalCpuMask+="$cpu_id,"
+                fi
+            done
+        done
+        FinalCpuMask=${FinalCpuMask%,}
+    fi
+
+    TargetNormalizedMask=$(normalize_affinity "$FinalCpuMask")
+}
+
+# --- Process Analysis & Filtering ---
+
+is_gaming_process() {
+    local pid="$1"
+
+    # If OnlyGaming is false, we can optimize anything that uses the GPU
+    [ "$OnlyGaming" = false ] && return 0
+
+    # 1. Known Blacklist (Non-gaming GPU heavy apps)
+    local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+    case "$proc_comm" in
+        Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) return 1 ;;
+        chrome|firefox|brave|msedge|opera|browser) return 1 ;;
+        steamwebhelper|Discord|slack|teams|obs|obs64|heroic) return 1 ;;
+    esac
+
+    # 2. Heuristics (Exclude Electron/Chrome-based UI processes like Heroic or Steam's web helper)
+    local proc_args=$(ps -fp "$pid" -o args= 2>/dev/null)
+    if echo "$proc_args" | grep -qE -- "--type=(zygote|renderer|gpu-process|utility)"; then
+        return 1
+    fi
+
+    # 3. Gaming Environment Variables
+    if [ -r "/proc/$pid/environ" ]; then
+        # Check for Steam, Proton, Lutris, Heroic markers
+        if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qE "^(STEAM_COMPAT_APP_ID|STEAM_GAME_ID|LUTRIS_GAME_ID|HEROIC_APP_NAME|PROTON_VER|WINEPREFIX)="; then
+            return 0
+        fi
+    fi
+
+    # 4. Heuristics (Wine/Proton processes, Game executables)
+    if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer"; then
+        return 0
+    fi
+
+    # 5. Check Parent Processes (up to 3 levels)
+    local ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+    for i in {1..3}; do
+        [ -z "$ppid" ] || [ "$ppid" -lt 10 ] && break
+        local p_comm=$(ps -p "$ppid" -o comm= 2>/dev/null)
+        case "$p_comm" in
+            steam|lutris|heroic|wine|wineserver) return 0 ;;
+        esac
+        ppid=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ')
+    done
+
+    return 1
+}
+
+# --- System Optimization & Tuning ---
 
 system_tune() {
     [ "$SkipSystemTune" = true ] && return
@@ -240,120 +442,8 @@ system_tune() {
     fi
 }
 
-get_nearby_nodes() {
-    local target_node=$1
-    local nearby=()
+# --- Core Logic & Execution ---
 
-    if [ "$target_node" -lt 0 ]; then
-        echo ""
-        return
-    fi
-
-    # Use numactl to get distances if available
-    if command -v numactl >/dev/null 2>&1; then
-        local distances=$(numactl --hardware | awk -v node="$target_node" '$1 == node":" {for(i=2; i<=NF; i++) print $i}')
-        if [ -n "$distances" ]; then
-            local i=0
-            while read -r dist; do
-                if [ "$dist" -le "$MaxDist" ]; then
-                    nearby+=("$i")
-                fi
-                ((i++))
-            done <<< "$distances"
-            echo "${nearby[*]}" | tr ' ' ','
-            return
-        fi
-    fi
-
-    # Fallback to just the target node
-    echo "$target_node"
-}
-
-get_nodes_cpulist() {
-    local nodes=$1
-    local combined=""
-    IFS=',' read -ra node_list <<< "$nodes"
-    for node in "${node_list[@]}"; do
-        local cpulist=$(cat "/sys/devices/system/node/node$node/cpulist" 2>/dev/null)
-        [ -n "$cpulist" ] && combined+="$cpulist,"
-    done
-    echo "${combined%,}"
-}
-
-normalize_affinity() {
-    # shellcheck disable=SC2162
-    echo "$1" | tr ',' '\n' | while read r; do
-        # shellcheck disable=SC2086
-        if [[ $r == *-* ]]; then seq ${r%-*} ${r#*-}; else echo $r; fi
-    done | sort -n | tr '\n' ',' | sed 's/,$//'
-}
-
-get_node_free_kb() {
-    # shellcheck disable=SC2086
-    local free_kb=$(grep -i "Node $1 MemFree" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
-    echo "${free_kb:-0}"
-}
-
-get_node_total_mb() {
-    # shellcheck disable=SC2086
-    local total_kb=$(grep -i "Node $1 MemTotal" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
-    echo "$(( ${total_kb:-0} / 1024 ))"
-}
-
-get_node_used_mb() {
-    # shellcheck disable=SC2086
-    local used_kb=$(grep -i "Node $1 MemUsed" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
-    echo "$(( ${used_kb:-0} / 1024 ))"
-}
-
-is_gaming_process() {
-    local pid="$1"
-
-    # If OnlyGaming is false, we can optimize anything that uses the GPU
-    [ "$OnlyGaming" = false ] && return 0
-
-    # 1. Known Blacklist (Non-gaming GPU heavy apps)
-    local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
-    case "$proc_comm" in
-        Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) return 1 ;;
-        chrome|firefox|brave|msedge|opera|browser) return 1 ;;
-        steamwebhelper|Discord|slack|teams|obs|obs64|heroic) return 1 ;;
-    esac
-
-    # 2. Heuristics (Exclude Electron/Chrome-based UI processes like Heroic or Steam's web helper)
-    local proc_args=$(ps -fp "$pid" -o args= 2>/dev/null)
-    if echo "$proc_args" | grep -qE -- "--type=(zygote|renderer|gpu-process|utility)"; then
-        return 1
-    fi
-
-    # 3. Gaming Environment Variables
-    if [ -r "/proc/$pid/environ" ]; then
-        # Check for Steam, Proton, Lutris, Heroic markers
-        if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qE "^(STEAM_COMPAT_APP_ID|STEAM_GAME_ID|LUTRIS_GAME_ID|HEROIC_APP_NAME|PROTON_VER|WINEPREFIX)="; then
-            return 0
-        fi
-    fi
-
-    # 4. Heuristics (Wine/Proton processes, Game executables)
-    if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer"; then
-        return 0
-    fi
-
-    # 5. Check Parent Processes (up to 3 levels)
-    local ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
-    for i in {1..3}; do
-        [ -z "$ppid" ] || [ "$ppid" -lt 10 ] && break
-        local p_comm=$(ps -p "$ppid" -o comm= 2>/dev/null)
-        case "$p_comm" in
-            steam|lutris|heroic|wine|wineserver) return 0 ;;
-        esac
-        ppid=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ')
-    done
-
-    return 1
-}
-
-# 5. Optimization Function
 run_optimization() {
     # Cross-vendor PID detection (Render nodes and NVIDIA devices)
     local gpu_pids=$(fuser /dev/dri/renderD* /dev/nvidia* 2>/dev/null | tr ' ' '\n' | sort -u)
@@ -430,12 +520,12 @@ run_optimization() {
             # Queue for notification
             PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${NearbyNodeIds:-$NumaNodeId}|$process_rss_kb")
 
-            printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
+            status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
         else
             # Already optimized
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 # If we are in startup phase or just noticed it, print it
-                printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED" "$full_proc_cmd"
+                status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED" "$full_proc_cmd"
             fi
         fi
 
@@ -449,32 +539,33 @@ run_optimization() {
 check_active_optimizations() {
     local now=$(date +%s)
     if [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
-        echo "------------------------------------------------------------------------------------------------"
-        echo "PERIODIC STATUS SUMMARY ($(date "+%Y-%m-%d %H:%M:%S")) - $TotalOptimizedCount processes optimized since startup"
-        printf "%-8s | %-15s | %-18s | %-25s | %s\n" "PID" "EXE" "ORIG. AFFINITY" "STATUS" "COMMAND"
-        echo "------------------------------------------------------------------------------------------------"
+        if [ ${#OptimizedPidsMap[@]} -eq 0 ]; then
+            echo "No processes currently optimized"
+        else
+            echo "PERIODIC STATUS SUMMARY ($(date "+%Y-%m-%d %H:%M:%S")) - $TotalOptimizedCount processes optimized since startup"
 
-        # Sort PIDs numerically for consistent output
-        local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
+            # Sort PIDs numerically for consistent output
+            local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 
-        for pid in $sorted_pids; do
-            if [ -d "/proc/$pid" ]; then
-                local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
-                local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
-                local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
-                [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
+            for pid in $sorted_pids; do
+                if [ -d "/proc/$pid" ]; then
+                    local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
+                    local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+                    local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
+                    [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
-                printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
-            else
-                unset "OptimizedPidsMap[$pid]"
-            fi
-        done
-        echo "------------------------------------------------------------------------------------------------"
+                    status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
+                else
+                    unset "OptimizedPidsMap[$pid]"
+                fi
+            done
+            echo "------------------------------------------------------------------------------------------------"
+        fi
         LastSummaryTime=$now
     fi
 }
 
-# --- Main Script ---
+# --- CLI & Startup ---
 
 parse_args() {
     while [[ "$#" -gt 0 ]]; do
@@ -493,76 +584,20 @@ parse_args() {
     done
 }
 
-detect_gpu() {
-    mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
-    GpuIndexArg=${GpuIndexArg:-0}
-
-    if [ "${#all_vga_devices[@]}" -eq 0 ]; then
-        echo "Error: No GPU (VGA/3D) devices detected via lspci."
-        exit 1
-    fi
-
-    if [ "$GpuIndexArg" -ge "${#all_vga_devices[@]}" ]; then
-        echo "Error: GPU index $GpuIndexArg not found (Found ${#all_vga_devices[@]} GPUs)."
-        exit 1
-    fi
-
-    PciAddr=$(echo "${all_vga_devices[$GpuIndexArg]}" | awk '{print $1}')
-
-    if [ -z "$PciAddr" ]; then
-        echo "Error: Could not determine PCI address for GPU index $GpuIndexArg."
-        exit 1
-    fi
-}
-
-discover_resources() {
-    local device_sys_dir="/sys/bus/pci/devices/$PciAddr"
-    if [ ! -d "$device_sys_dir" ]; then
-        echo "Error: PCI device directory $device_sys_dir not found."
-        exit 1
-    fi
-
-    NumaNodeId=$(cat "$device_sys_dir/numa_node" 2>/dev/null || echo -1)
-    RawCpuList=$(cat "$device_sys_dir/local_cpulist" 2>/dev/null || echo "")
-
-    NearbyNodeIds="$NumaNodeId"
-    if [ "$IncludeNearby" = true ]; then
-        NearbyNodeIds=$(get_nearby_nodes "$NumaNodeId")
-    fi
-
-    if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "$NumaNodeId" ]; then
-        RawCpuList=$(get_nodes_cpulist "$NearbyNodeIds")
-    fi
-
-    if [ -z "$RawCpuList" ]; then
-        echo "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
-        RawCpuList=$(cat /sys/devices/system/cpu/online 2>/dev/null)
-    fi
-}
-
-filter_cpus() {
-    FinalCpuMask=""
-    if [ "$UseHt" = true ]; then
-        FinalCpuMask="$RawCpuList"
-    else
-        IFS=',' read -ra cpu_ranges <<< "$RawCpuList"
-        for range in "${cpu_ranges[@]}"; do
-            [ -z "$range" ] && continue
-            # shellcheck disable=SC2086
-            [[ $range == *-* ]] && expanded_list=$(seq ${range%-*} ${range#*-}) || expanded_list=$range
-            for cpu_id in $expanded_list; do
-                sibling_file="/sys/devices/system/cpu/cpu$cpu_id/topology/thread_siblings_list"
-                if [ -f "$sibling_file" ]; then
-                    # shellcheck disable=SC2002
-                    first_sibling=$(cat "$sibling_file" | cut -d',' -f1 | cut -d'-' -f1)
-                    [[ "$cpu_id" -eq "$first_sibling" ]] && FinalCpuMask+="$cpu_id,"
-                fi
-            done
-        done
-        FinalCpuMask=${FinalCpuMask%,}
-    fi
-
-    TargetNormalizedMask=$(normalize_affinity "$FinalCpuMask")
+check_dependencies() {
+    local deps=("lspci" "fuser" "taskset" "numactl" "migratepages" "awk" "ps" "notify-send" "setpriv")
+    # Added /usr/sbin to path for setpriv and other system tools
+    PATH="$PATH:/usr/sbin:/sbin"
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            if [ "$cmd" = "notify-send" ] || [ "$cmd" = "setpriv" ]; then
+                echo "Warning: '$cmd' not found. Desktop notifications or privilege dropping may be limited."
+            else
+                echo "Error: Required command '$cmd' not found."
+                exit 1
+            fi
+        fi
+    done
 }
 
 print_banner() {
@@ -588,38 +623,11 @@ print_banner() {
     echo "MEM POLICY       : $mem_policy_label"
     echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
     echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
-    echo "------------------------------------------------------------------------------------------------"
-    printf "%-8s | %-15s | %-18s | %-25s | %s\n" "PID" "EXE" "ORIG. AFFINITY" "STATUS" "COMMAND"
-    echo "------------------------------------------------------------------------------------------------"
+
+    status_log
 }
 
-run_main_loop() {
-    if [ "$DaemonMode" = true ]; then
-        while true; do
-            run_optimization
-            
-            # If we optimized something, wait SleepInterval + 5 before notifying
-            # to catch any subsequent processes (e.g. game launcher -> game exe)
-            if [ ${#PendingOptimizations[@]} -gt 0 ]; then
-                log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
-                sleep $((SleepInterval + 5))
-                # Run one more time to catch immediate followers before flushing
-                run_optimization
-                flush_notifications
-            fi
-
-            check_active_optimizations
-            sleep "$SleepInterval"
-        done
-    else
-        run_optimization
-        flush_notifications
-        echo "------------------------------------------------------------------------------------------------"
-        echo "Optimization complete."
-    fi
-}
-
-# --- Initialization ---
+# --- Main Script Execution ---
 
 echo "--------------------------------------------------------"
 parse_args "$@"
@@ -638,5 +646,28 @@ fi
 detect_gpu
 discover_resources
 filter_cpus
+
 print_banner
-run_main_loop
+if [ "$DaemonMode" = true ]; then
+    while true; do
+        run_optimization
+
+        # If we optimized something, wait SleepInterval + 5 before notifying
+        # to catch any subsequent processes (e.g. game launcher -> game exe)
+        if [ ${#PendingOptimizations[@]} -gt 0 ]; then
+            log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
+            sleep $((SleepInterval + 5))
+            # Run one more time to catch immediate followers before flushing
+            run_optimization
+            flush_notifications
+        fi
+
+        check_active_optimizations
+        sleep "$SleepInterval"
+    done
+else
+    run_optimization
+    flush_notifications
+    echo "------------------------------------------------------------------------------------------------"
+    echo "Optimization complete."
+fi
