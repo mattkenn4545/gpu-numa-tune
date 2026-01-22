@@ -23,7 +23,27 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 
 ## 🚀 Quick Start
 
-### 1. Installation
+### 1. Prerequisites
+
+Before installing, ensure you have the necessary tools. On most distributions, these can be installed via:
+
+**Debian/Ubuntu:**
+```bash
+sudo apt update
+sudo apt install pciutils psmisc util-linux numactl procps libnotify-bin
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S pciutils psmisc util-linux numactl procps-ng libnotify
+```
+
+**Fedora:**
+```bash
+sudo dnf install pciutils psmisc util-linux numactl procps-ng libnotify
+```
+
+### 2. Installation
 
 Getting up and running takes seconds:
 
@@ -35,15 +55,19 @@ sudo ./install.sh
 
 The installer will copy the script to `/usr/local/bin`, set up a systemd service, and start it immediately.
 
-### 2. Tweaking Settings
+### 3. Tweaking Settings
 
 The optimizer is designed to work out-of-the-box, but you can customize its behavior by editing the systemd service file or running the script manually.
 
 **Common Options:**
 - `-p, --physical-only`: Skip SMT/Hyper-threading siblings (often better for gaming).
+- `-d, --daemon`: Run in daemon mode (periodically checks for new processes).
 - `-s, --strict`: Force memory to stay on the local node (OOM risk if node is small, but maximum performance).
+- `-l, --local-only`: Disable "nearby node" logic and stick strictly to the GPU's primary node.
 - `-a, --all-gpu-procs`: Optimize *every* process using the GPU, not just games.
-- `-l, --local-only`: Disable "nearby node" logic and stick strictly to the primary node.
+- `-x, --no-tune`: Skip system-level kernel tuning (sysctl, etc.).
+- `-k, --no-drop`: Do not drop root privileges (useful for certain troubleshooting).
+- `-h, --help`: Show full usage information.
 
 **To edit the service settings:**
 1. Run `sudo systemctl edit --full gpu-numa-optimizer.service`
@@ -76,7 +100,13 @@ Once a game is identified, the script applies three distinct optimizations:
 - **Memory Policy (`numactl`)**: Sets the process's memory allocation policy to `preferred` (or `strict` with `--strict`) for the target NUMA nodes.
 - **Live Migration (`migratepages`)**: Moves existing memory pages from "slow" remote nodes to the "fast" local node in real-time without restarting the game.
 
-### 4. Kernel Latency Tuning
+### 4. Privilege Management & Security
+To ensure maximum performance while maintaining security, the script handles privileges intelligently:
+- **Kernel Tuning**: System-level optimizations (sysctl, CPU governor) require root and are performed once at startup.
+- **Privilege Dropping (`setpriv`)**: After performing root-only tasks, the daemon automatically drops its privileges to the user currently running the X11/Wayland session. This allows it to send desktop notifications and interact with user processes safely.
+- **Manual Control**: Use `--no-drop` if you need to keep root privileges for specific debugging scenarios.
+
+### 5. Kernel Latency Tuning
 If run as root, the script applies several system-level tweaks to reduce micro-stutter and ensure consistent performance:
 - **`kernel.numa_balancing=0`**: Disables the kernel's automatic NUMA balancer, which can cause unpredictable "stutters" when it moves memory behind the game's back.
 - **`vm.max_map_count`**: Increased to handle the heavy memory mapping requirements of modern AAA titles and Wine/Proton.
@@ -87,7 +117,7 @@ If run as root, the script applies several system-level tweaks to reduce micro-s
 - **Transparent Hugepages (THP)**: Set to `never` to prevent micro-stutters and stalls during dynamic allocation and defragmentation.
 - **CPU Scaling Governor**: Automatically sets all cores to `performance` mode to prevent downclocking during gameplay.
 
-### 5. Smart Notification Aggregation
+### 6. Smart Notification Aggregation
 To prevent notification spam during complex game launches (e.g., Wine/Proton games starting `wineserver`, `explorer.exe`, and the game itself), the script implements a buffering system:
 - **Delayed Delivery**: When a new optimization is detected, the daemon waits `SleepInterval + 5` seconds to catch any subsequent processes.
 - **Amalgamated Messaging**: All processes optimized within that window are grouped into a single notification.
