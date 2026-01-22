@@ -22,17 +22,13 @@ export PATH="$PATH:$(pwd)/tests/mock_bin"
 mkdir -p tests/mock_bin
 
 # Create mocks for external commands
-cat <<EOF > tests/mock_bin/lspci
-#!/bin/bash
-echo "0000:01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
-EOF
-chmod +x tests/mock_bin/lspci
+lspci() {
+    echo "0000:01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+}
 
-cat <<EOF > tests/mock_bin/notify-send
-#!/bin/bash
-exit 0
-EOF
-chmod +x tests/mock_bin/notify-send
+notify-send() {
+    return 0
+}
 
 source ./gpu_optimize.sh
 
@@ -59,10 +55,11 @@ assert_eq "0,1,2,3" "$(normalize_affinity "0,1,2,3")" "normalize_affinity alread
 assert_eq "0,1,2,3" "$(normalize_affinity "3,2,1,0")" "normalize_affinity sorting"
 
 # Test 2: parse_args
-parse_args "-p" "--daemon" "-s"
+parse_args "-p" "--daemon" "-s" "1"
 assert_eq "false" "$UseHt" "parse_args --physical-only"
 assert_eq "true" "$DaemonMode" "parse_args --daemon"
 assert_eq "true" "$StrictMem" "parse_args --strict"
+assert_eq "1" "$GpuIndexArg" "parse_args GpuIndexArg"
 
 parse_args "-l" "-a" "-x" "-k"
 assert_eq "false" "$IncludeNearby" "parse_args --local-only"
@@ -112,6 +109,15 @@ ps() {
         *"-fp 1234 -o args="*) echo "./game_exe" ;;
         *"-fp 5678 -o args="*) echo "/usr/bin/chrome --type=renderer" ;;
         *"-p 1234 -o ppid="*) echo "1" ;;
+        *"-p 1111 -o comm="*) echo "some_child" ;;
+        *"-fp 1111 -o args="*) echo "./some_child" ;;
+        *"-p 1111 -o ppid="*) echo "2222" ;;
+        *"-p 2222 -o comm="*) echo "steam" ;;
+        *"-fp 2222 -o args="*) echo "/usr/bin/steam" ;;
+        *"-p 2222 -o ppid="*) echo "1" ;;
+        *"-p 3333 -o comm="*) echo "wine_proc" ;;
+        *"-fp 3333 -o args="*) echo "/usr/bin/wine some_game.exe" ;;
+        *"-p 3333 -o ppid="*) echo "1" ;;
         *) command ps "$@" ;;
     esac
 }
@@ -120,6 +126,8 @@ ps() {
 echo -e "STEAM_GAME_ID=123\0" > "$PROC_PREFIX/proc/1234/environ"
 
 assert_eq "0" "$(is_gaming_process 1234; echo $?)" "is_gaming_process with STEAM_GAME_ID (allowed)"
+assert_eq "0" "$(is_gaming_process 1111; echo $?)" "is_gaming_process child of steam (allowed)"
+assert_eq "0" "$(is_gaming_process 3333; echo $?)" "is_gaming_process wine .exe (allowed)"
 
 # Test 4: Hardware discovery (using SYSFS_PREFIX)
 export SYSFS_PREFIX="$(pwd)/tests/mock_sys"
@@ -134,7 +142,50 @@ discover_resources
 assert_eq "0" "$NumaNodeId" "discover_resources NumaNodeId"
 assert_eq "0-7" "$RawCpuList" "discover_resources RawCpuList"
 
-# Test 5: filter_cpus (SMT/HT)
+# Test 5: get_nearby_nodes and get_nodes_cpulist
+mkdir -p "$SYSFS_PREFIX/sys/devices/system/node/node"{0..1}
+echo "0-3" > "$SYSFS_PREFIX/sys/devices/system/node/node0/cpulist"
+echo "4-7" > "$SYSFS_PREFIX/sys/devices/system/node/node1/cpulist"
+
+# Mock numactl --hardware
+numactl() {
+    if [[ "$*" == "--hardware" ]]; then
+        echo "available: 2 nodes (0-1)"
+        echo "node 0 cpus: 0 1 2 3"
+        echo "node 0 size: 16100 MB"
+        echo "node 0 free: 12000 MB"
+        echo "node 1 cpus: 4 5 6 7"
+        echo "node 1 size: 16100 MB"
+        echo "node 1 free: 11000 MB"
+        echo "node distances:"
+        echo "node   0   1"
+        echo "  0:  10  11"
+        echo "  1:  11  10"
+    else
+        command numactl "$@"
+    fi
+}
+
+MaxDist=11
+assert_eq "0,1" "$(get_nearby_nodes 0)" "get_nearby_nodes with numactl"
+assert_eq "0-3,4-7" "$(get_nodes_cpulist "0,1")" "get_nodes_cpulist"
+
+# Test without numactl
+numactl() {
+    return 127
+}
+assert_eq "0" "$(get_nearby_nodes 0)" "get_nearby_nodes without numactl"
+
+# Test 6: Memory utils
+echo "Node 0 MemTotal: 16486400 kB" > "$SYSFS_PREFIX/sys/devices/system/node/node0/meminfo"
+echo "Node 0 MemFree:  12288000 kB" >> "$SYSFS_PREFIX/sys/devices/system/node/node0/meminfo"
+echo "Node 0 MemUsed:   4198400 kB" >> "$SYSFS_PREFIX/sys/devices/system/node/node0/meminfo"
+
+assert_eq "16100" "$(get_node_total_mb 0)" "get_node_total_mb"
+assert_eq "12288000" "$(get_node_free_kb 0)" "get_node_free_kb"
+assert_eq "4100" "$(get_node_used_mb 0)" "get_node_used_mb"
+
+# Test 7: filter_cpus (SMT/HT)
 mkdir -p "$SYSFS_PREFIX/sys/devices/system/cpu/cpu"{0..7}"/topology"
 # Mock siblings: 0 and 4 are siblings, 1 and 5, etc.
 echo "0,4" > "$SYSFS_PREFIX/sys/devices/system/cpu/cpu0/topology/thread_siblings_list"
@@ -154,6 +205,16 @@ assert_eq "0,1,2,3" "$TargetNormalizedMask" "filter_cpus physical-only"
 UseHt=true
 filter_cpus
 assert_eq "0,1,2,3,4,5,6,7" "$TargetNormalizedMask" "filter_cpus HT allowed"
+
+# Test 8: detect_gpu
+lspci() {
+    echo "0000:01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+    echo "0000:41:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+}
+
+GpuIndexArg=1
+detect_gpu
+assert_eq "0000:41:00.0" "$PciAddr" "detect_gpu index 1"
 
 echo -e "\nSummary: ${GREEN}$PASSED passed${NC}, ${RED}$FAILED failed${NC}"
 if [ $FAILED -gt 0 ]; then
