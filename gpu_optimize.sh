@@ -33,6 +33,8 @@ TargetUser=""
 TargetUid=""
 TargetGid=""
 
+# Functions
+
 detect_target_user() {
     # Try to find the user running the graphical session
     local detected_user=""
@@ -125,6 +127,7 @@ flush_notifications() {
         # Fields: pid|comm|simplified|status|nodes|rss
         local IFS_BACKUP=$IFS
         IFS=$'\n'
+        # shellcheck disable=SC2207
         sorted_pending=($(printf "%s\n" "${PendingOptimizations[@]}" | sort -t'|' -k6,6rn))
         IFS=$IFS_BACKUP
     else
@@ -133,13 +136,13 @@ flush_notifications() {
 
     local count=${#sorted_pending[@]}
     local primary_data="${sorted_pending[0]}"
-    
+
     IFS='|' read -r p_pid p_comm p_simplified p_status p_nodes p_rss <<< "$primary_data"
-    
+
     local title=""
     local message=""
     local icon="dialog-information"
-    
+
     if [ "$count" -eq 1 ]; then
         title="$p_comm (PID: $p_pid): $p_status"
         message="$p_simplified\n\nCPU affinity set and memory handled on Nodes $p_nodes"
@@ -159,7 +162,7 @@ flush_notifications() {
     fi
 
     notify_user "$title" "$message" "$icon"
-    
+
     # Clear the buffer
     PendingOptimizations=()
 }
@@ -172,9 +175,6 @@ log() {
     fi
 }
 
-echo "--------------------------------------------------------"
-
-# --- Root Check & Validated System Tuning ---
 system_tune() {
     [ "$SkipSystemTune" = true ] && return
 
@@ -240,64 +240,6 @@ system_tune() {
     fi
 }
 
-# 1. Argument Parsing
-while [[ "$1" =~ ^- ]]; do
-    case $1 in
-        -p|--physical-only) UseHt=false; shift ;;
-        -d|--daemon) DaemonMode=true; shift ;;
-        -s|--strict) StrictMem=true; shift ;;
-        -l|--local-only) IncludeNearby=false; shift ;;
-        -a|--all-gpu-procs) OnlyGaming=false; shift ;;
-        -x|--no-tune) SkipSystemTune=true; shift ;;
-        -k|--no-drop) DropPrivs=false; shift ;;
-        -h|--help) usage ;;
-        *) echo "Unknown option: $1" ; usage ;;
-    esac
-done
-
-check_dependencies
-system_tune
-detect_target_user
-
-# Drop privileges if a target user was detected, we are root, and dropping is enabled
-if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
-    echo "--> Dropping privileges to $TargetUser..."
-    # Prepare the command to re-execute itself as the target user
-    # We add --no-tune and --no-drop to avoid re-running system tuning and re-attempting priv drop
-    exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "${OriginalArgs[@]}"
-fi
-
-# 2. Identify GPUs (NVIDIA, AMD, Intel)
-mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
-gpu_index_arg=${1:-0}
-
-if [ "${#all_vga_devices[@]}" -eq 0 ]; then
-    echo "Error: No GPU (VGA/3D) devices detected via lspci."
-    exit 1
-fi
-
-if [ "$gpu_index_arg" -ge "${#all_vga_devices[@]}" ]; then
-    echo "Error: GPU index $gpu_index_arg not found (Found ${#all_vga_devices[@]} GPUs)."
-    exit 1
-fi
-
-pci_addr=$(echo "${all_vga_devices[$gpu_index_arg]}" | awk '{print $1}')
-
-if [ -z "$pci_addr" ]; then
-    echo "Error: Could not determine PCI address for GPU index $gpu_index_arg."
-    exit 1
-fi
-
-# 3. Identify NUMA Node and CPU List
-device_sys_dir="/sys/bus/pci/devices/$pci_addr"
-if [ ! -d "$device_sys_dir" ]; then
-    echo "Error: PCI device directory $device_sys_dir not found."
-    exit 1
-fi
-
-numa_node_id=$(cat "$device_sys_dir/numa_node" 2>/dev/null || echo -1)
-raw_cpu_list=$(cat "$device_sys_dir/local_cpulist" 2>/dev/null || echo "")
-
 get_nearby_nodes() {
     local target_node=$1
     local nearby=()
@@ -338,42 +280,6 @@ get_nodes_cpulist() {
     echo "${combined%,}"
 }
 
-nearby_node_ids="$numa_node_id"
-if [ "$IncludeNearby" = true ]; then
-    nearby_node_ids=$(get_nearby_nodes "$numa_node_id")
-fi
-
-if [ -n "$nearby_node_ids" ] && [ "$nearby_node_ids" != "$numa_node_id" ]; then
-    raw_cpu_list=$(get_nodes_cpulist "$nearby_node_ids")
-fi
-
-if [ -z "$raw_cpu_list" ]; then
-    echo "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
-    raw_cpu_list=$(cat /sys/devices/system/cpu/online 2>/dev/null)
-fi
-
-# 4. Filter CPU List (HT vs Physical)
-final_cpu_mask=""
-if [ "$UseHt" = true ]; then
-    final_cpu_mask="$raw_cpu_list"
-else
-    IFS=',' read -ra cpu_ranges <<< "$raw_cpu_list"
-    for range in "${cpu_ranges[@]}"; do
-        [ -z "$range" ] && continue
-        # shellcheck disable=SC2086
-        [[ $range == *-* ]] && expanded_list=$(seq ${range%-*} ${range#*-}) || expanded_list=$range
-        for cpu_id in $expanded_list; do
-            sibling_file="/sys/devices/system/cpu/cpu$cpu_id/topology/thread_siblings_list"
-            if [ -f "$sibling_file" ]; then
-                # shellcheck disable=SC2002
-                first_sibling=$(cat "$sibling_file" | cut -d',' -f1 | cut -d'-' -f1)
-                [[ "$cpu_id" -eq "$first_sibling" ]] && final_cpu_mask+="$cpu_id,"
-            fi
-        done
-    done
-    final_cpu_mask=${final_cpu_mask%,}
-fi
-
 normalize_affinity() {
     # shellcheck disable=SC2162
     echo "$1" | tr ',' '\n' | while read r; do
@@ -399,33 +305,6 @@ get_node_used_mb() {
     local used_kb=$(grep -i "Node $1 MemUsed" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
     echo "$(( ${used_kb:-0} / 1024 ))"
 }
-
-target_normalized_mask=$(normalize_affinity "$final_cpu_mask")
-mem_policy_label=$([ "$StrictMem" = true ] && echo "Strict (OOM Risk)" || echo "Preferred (Safe)")
-
-# --- Startup Output ---
-echo "GPU MODEL        :$(lspci -s "$pci_addr" | cut -d: -f3) ($pci_addr)"
-
-if [ "$numa_node_id" -ge 0 ]; then
-    if [ -n "$nearby_node_ids" ]; then
-        echo "NUMA NODES       : $nearby_node_ids (Nearby Max Distance $MaxDist)"
-        IFS=',' read -ra nodes <<< "$nearby_node_ids"
-        for node in "${nodes[@]}"; do
-           echo "NODE $node SIZE      : $(get_node_total_mb "$node") MB"
-        done
-    else
-        echo "NUMA NODE        : $numa_node_id"
-        echo "NUMA NODE SIZE   : $(get_node_total_mb "$numa_node_id") MB"
-    fi
-fi
-
-echo "CPU TARGETS      : $( [ "$UseHt" = true ] && echo "HT Allowed" || echo "Physical Only" ) ($final_cpu_mask)"
-echo "MEM POLICY       : $mem_policy_label"
-echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
-echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
-echo "------------------------------------------------------------------------------------------------"
-printf "%-8s | %-15s | %-18s | %-25s | %s\n" "PID" "EXE" "ORIG. AFFINITY" "STATUS" "COMMAND"
-echo "------------------------------------------------------------------------------------------------"
 
 is_gaming_process() {
     local pid="$1"
@@ -498,19 +377,19 @@ run_optimization() {
         local full_proc_cmd=$(ps -fp "$pid" -o args= | tail -n 1)
         [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
-        if [ "$current_normalized_mask" != "$target_normalized_mask" ]; then
-            taskset -pc "$final_cpu_mask" "$pid" > /dev/null 2>&1
+        if [ "$current_normalized_mask" != "$TargetNormalizedMask" ]; then
+            taskset -pc "$FinalCpuMask" "$pid" > /dev/null 2>&1
 
             if [ "$StrictMem" = true ]; then
-                numactl --membind="${nearby_node_ids:-$numa_node_id}" -p "$pid" > /dev/null 2>&1
+                numactl --membind="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
             else
                 # Try preferred-many if multiple nodes are present, fallback to preferred
-                if [[ "$nearby_node_ids" == *","* ]]; then
-                    if ! numactl --preferred-many="$nearby_node_ids" -p "$pid" > /dev/null 2>&1; then
-                         numactl --preferred="${nearby_node_ids%%,*}" -p "$pid" > /dev/null 2>&1
+                if [[ "$NearbyNodeIds" == *","* ]]; then
+                    if ! numactl --preferred-many="$NearbyNodeIds" -p "$pid" > /dev/null 2>&1; then
+                         numactl --preferred="${NearbyNodeIds%%,*}" -p "$pid" > /dev/null 2>&1
                     fi
                 else
-                    numactl --preferred="${nearby_node_ids:-$numa_node_id}" -p "$pid" > /dev/null 2>&1
+                    numactl --preferred="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
                 fi
             fi
 
@@ -529,17 +408,17 @@ run_optimization() {
             fi
 
             local free_kb=0
-            if [ -n "$nearby_node_ids" ]; then
-                IFS=',' read -ra nodes <<< "$nearby_node_ids"
+            if [ -n "$NearbyNodeIds" ]; then
+                IFS=',' read -ra nodes <<< "$NearbyNodeIds"
                 for node in "${nodes[@]}"; do
                     free_kb=$((free_kb + $(get_node_free_kb "$node")))
                 done
             else
-                free_kb=$(get_node_free_kb "$numa_node_id")
+                free_kb=$(get_node_free_kb "$NumaNodeId")
             fi
 
             if [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
-                if migratepages "$pid" all "${nearby_node_ids:-$numa_node_id}" > /dev/null 2>&1; then
+                if migratepages "$pid" all "${NearbyNodeIds:-$NumaNodeId}" > /dev/null 2>&1; then
                     status_msg="OPTIMIZED & MOVED"
                 else
                     status_msg="OPTIMIZED (MOVE FAILED)"
@@ -549,7 +428,7 @@ run_optimization() {
             fi
 
             # Queue for notification
-            PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${nearby_node_ids:-$numa_node_id}|$process_rss_kb")
+            PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${NearbyNodeIds:-$NumaNodeId}|$process_rss_kb")
 
             printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
         else
@@ -574,7 +453,7 @@ check_active_optimizations() {
         echo "PERIODIC STATUS SUMMARY ($(date "+%Y-%m-%d %H:%M:%S")) - $TotalOptimizedCount processes optimized since startup"
         printf "%-8s | %-15s | %-18s | %-25s | %s\n" "PID" "EXE" "ORIG. AFFINITY" "STATUS" "COMMAND"
         echo "------------------------------------------------------------------------------------------------"
-        
+
         # Sort PIDs numerically for consistent output
         local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 
@@ -595,27 +474,169 @@ check_active_optimizations() {
     fi
 }
 
-# 6. Execution Loop
-if [ "$DaemonMode" = true ]; then
-    while true; do
-        run_optimization
-        
-        # If we optimized something, wait SleepInterval + 5 before notifying
-        # to catch any subsequent processes (e.g. game launcher -> game exe)
-        if [ ${#PendingOptimizations[@]} -gt 0 ]; then
-            log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
-            sleep $((SleepInterval + 5))
-            # Run one more time to catch immediate followers before flushing
-            run_optimization
-            flush_notifications
-        fi
+# --- Main Script ---
 
-        check_active_optimizations
-        sleep "$SleepInterval"
+parse_args() {
+    while [[ "$#" -gt 0 ]]; do
+        case $1 in
+            -p|--physical-only) UseHt=false; shift ;;
+            -d|--daemon) DaemonMode=true; shift ;;
+            -s|--strict) StrictMem=true; shift ;;
+            -l|--local-only) IncludeNearby=false; shift ;;
+            -a|--all-gpu-procs) OnlyGaming=false; shift ;;
+            -x|--no-tune) SkipSystemTune=true; shift ;;
+            -k|--no-drop) DropPrivs=false; shift ;;
+            -h|--help) usage ;;
+            -*) echo "Unknown option: $1" ; usage ;;
+            *) GpuIndexArg=$1; shift ;;
+        esac
     done
-else
-    run_optimization
-    flush_notifications
+}
+
+detect_gpu() {
+    mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
+    GpuIndexArg=${GpuIndexArg:-0}
+
+    if [ "${#all_vga_devices[@]}" -eq 0 ]; then
+        echo "Error: No GPU (VGA/3D) devices detected via lspci."
+        exit 1
+    fi
+
+    if [ "$GpuIndexArg" -ge "${#all_vga_devices[@]}" ]; then
+        echo "Error: GPU index $GpuIndexArg not found (Found ${#all_vga_devices[@]} GPUs)."
+        exit 1
+    fi
+
+    PciAddr=$(echo "${all_vga_devices[$GpuIndexArg]}" | awk '{print $1}')
+
+    if [ -z "$PciAddr" ]; then
+        echo "Error: Could not determine PCI address for GPU index $GpuIndexArg."
+        exit 1
+    fi
+}
+
+discover_resources() {
+    local device_sys_dir="/sys/bus/pci/devices/$PciAddr"
+    if [ ! -d "$device_sys_dir" ]; then
+        echo "Error: PCI device directory $device_sys_dir not found."
+        exit 1
+    fi
+
+    NumaNodeId=$(cat "$device_sys_dir/numa_node" 2>/dev/null || echo -1)
+    RawCpuList=$(cat "$device_sys_dir/local_cpulist" 2>/dev/null || echo "")
+
+    NearbyNodeIds="$NumaNodeId"
+    if [ "$IncludeNearby" = true ]; then
+        NearbyNodeIds=$(get_nearby_nodes "$NumaNodeId")
+    fi
+
+    if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "$NumaNodeId" ]; then
+        RawCpuList=$(get_nodes_cpulist "$NearbyNodeIds")
+    fi
+
+    if [ -z "$RawCpuList" ]; then
+        echo "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
+        RawCpuList=$(cat /sys/devices/system/cpu/online 2>/dev/null)
+    fi
+}
+
+filter_cpus() {
+    FinalCpuMask=""
+    if [ "$UseHt" = true ]; then
+        FinalCpuMask="$RawCpuList"
+    else
+        IFS=',' read -ra cpu_ranges <<< "$RawCpuList"
+        for range in "${cpu_ranges[@]}"; do
+            [ -z "$range" ] && continue
+            # shellcheck disable=SC2086
+            [[ $range == *-* ]] && expanded_list=$(seq ${range%-*} ${range#*-}) || expanded_list=$range
+            for cpu_id in $expanded_list; do
+                sibling_file="/sys/devices/system/cpu/cpu$cpu_id/topology/thread_siblings_list"
+                if [ -f "$sibling_file" ]; then
+                    # shellcheck disable=SC2002
+                    first_sibling=$(cat "$sibling_file" | cut -d',' -f1 | cut -d'-' -f1)
+                    [[ "$cpu_id" -eq "$first_sibling" ]] && FinalCpuMask+="$cpu_id,"
+                fi
+            done
+        done
+        FinalCpuMask=${FinalCpuMask%,}
+    fi
+
+    TargetNormalizedMask=$(normalize_affinity "$FinalCpuMask")
+}
+
+print_banner() {
+    local mem_policy_label=$([ "$StrictMem" = true ] && echo "Strict (OOM Risk)" || echo "Preferred (Safe)")
+    
     echo "------------------------------------------------------------------------------------------------"
-    echo "Optimization complete."
+    echo "GPU MODEL        :$(lspci -s "$PciAddr" | cut -d: -f3) ($PciAddr)"
+
+    if [ "$NumaNodeId" -ge 0 ]; then
+        if [ -n "$NearbyNodeIds" ]; then
+            echo "NUMA NODES       : $NearbyNodeIds (Nearby Max Distance $MaxDist)"
+            IFS=',' read -ra nodes <<< "$NearbyNodeIds"
+            for node in "${nodes[@]}"; do
+               echo "NODE $node SIZE      : $(get_node_total_mb "$node") MB"
+            done
+        else
+            echo "NUMA NODE        : $NumaNodeId"
+            echo "NUMA NODE SIZE   : $(get_node_total_mb "$NumaNodeId") MB"
+        fi
+    fi
+
+    echo "CPU TARGETS      : $( [ "$UseHt" = true ] && echo "HT Allowed" || echo "Physical Only" ) ($FinalCpuMask)"
+    echo "MEM POLICY       : $mem_policy_label"
+    echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
+    echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
+    echo "------------------------------------------------------------------------------------------------"
+    printf "%-8s | %-15s | %-18s | %-25s | %s\n" "PID" "EXE" "ORIG. AFFINITY" "STATUS" "COMMAND"
+    echo "------------------------------------------------------------------------------------------------"
+}
+
+run_main_loop() {
+    if [ "$DaemonMode" = true ]; then
+        while true; do
+            run_optimization
+            
+            # If we optimized something, wait SleepInterval + 5 before notifying
+            # to catch any subsequent processes (e.g. game launcher -> game exe)
+            if [ ${#PendingOptimizations[@]} -gt 0 ]; then
+                log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
+                sleep $((SleepInterval + 5))
+                # Run one more time to catch immediate followers before flushing
+                run_optimization
+                flush_notifications
+            fi
+
+            check_active_optimizations
+            sleep "$SleepInterval"
+        done
+    else
+        run_optimization
+        flush_notifications
+        echo "------------------------------------------------------------------------------------------------"
+        echo "Optimization complete."
+    fi
+}
+
+# --- Initialization ---
+
+echo "--------------------------------------------------------"
+parse_args "$@"
+check_dependencies
+system_tune
+detect_target_user
+
+# Drop privileges if a target user was detected, we are root, and dropping is enabled
+if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
+    echo "--> Dropping privileges to $TargetUser..."
+    # Prepare the command to re-execute itself as the target user
+    # We add --no-tune and --no-drop to avoid re-running system tuning and re-attempting priv drop
+    exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "${OriginalArgs[@]}"
 fi
+
+detect_gpu
+discover_resources
+filter_cpus
+print_banner
+run_main_loop
