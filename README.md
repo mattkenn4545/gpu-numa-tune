@@ -80,6 +80,19 @@ The optimizer is designed to work out-of-the-box, but you can customize its beha
 
 ---
 
+## 🧪 Testing
+
+The project includes a test suite that mocks the system environment to verify the optimization logic.
+
+### Running Tests
+```bash
+./tests/run_tests.sh
+```
+
+The tests cover argument parsing, CPU affinity normalization, process heuristics, and hardware resource discovery logic.
+
+---
+
 ## 🛠️ Technical Details
 
 GPU NUMA Optimizer performs several layers of low-level system optimization to ensure zero-bottleneck performance.

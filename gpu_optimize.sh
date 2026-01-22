@@ -54,6 +54,10 @@ TargetGid=""
 
 # --- Utilities & Logging ---
 
+# Global mock prefix for testing
+SYSFS_PREFIX="${SYSFS_PREFIX:-}"
+PROC_PREFIX="${PROC_PREFIX:-}"
+
 # Displays a formatted table row for process optimization status
 status_log() {
     local pid="$1"
@@ -197,7 +201,7 @@ detect_gpu() {
 
 # Determines NUMA nodes and CPU list associated with the GPU
 discover_resources() {
-    local device_sys_dir="/sys/bus/pci/devices/$PciAddr"
+    local device_sys_dir="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr"
     if [ ! -d "$device_sys_dir" ]; then
         echo "Error: PCI device directory $device_sys_dir not found."
         exit 1
@@ -217,7 +221,7 @@ discover_resources() {
 
     if [ -z "$RawCpuList" ]; then
         echo "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
-        RawCpuList=$(cat /sys/devices/system/cpu/online 2>/dev/null)
+        RawCpuList=$(cat "$SYSFS_PREFIX/sys/devices/system/cpu/online" 2>/dev/null)
     fi
 }
 
@@ -255,7 +259,7 @@ get_nodes_cpulist() {
     local combined=""
     IFS=',' read -ra node_list <<< "$nodes"
     for node in "${node_list[@]}"; do
-        local cpulist=$(cat "/sys/devices/system/node/node$node/cpulist" 2>/dev/null)
+        local cpulist=$(cat "$SYSFS_PREFIX/sys/devices/system/node/node$node/cpulist" 2>/dev/null)
         [ -n "$cpulist" ] && combined+="$cpulist,"
     done
     echo "${combined%,}"
@@ -263,19 +267,19 @@ get_nodes_cpulist() {
 
 get_node_free_kb() {
     # shellcheck disable=SC2086
-    local free_kb=$(grep -i "Node $1 MemFree" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
+    local free_kb=$(grep -i "Node $1 MemFree" "$SYSFS_PREFIX/sys/devices/system/node/node$1/meminfo" 2>/dev/null | awk '{print $4}')
     echo "${free_kb:-0}"
 }
 
 get_node_total_mb() {
     # shellcheck disable=SC2086
-    local total_kb=$(grep -i "Node $1 MemTotal" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
+    local total_kb=$(grep -i "Node $1 MemTotal" "$SYSFS_PREFIX/sys/devices/system/node/node$1/meminfo" 2>/dev/null | awk '{print $4}')
     echo "$(( ${total_kb:-0} / 1024 ))"
 }
 
 get_node_used_mb() {
     # shellcheck disable=SC2086
-    local used_kb=$(grep -i "Node $1 MemUsed" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
+    local used_kb=$(grep -i "Node $1 MemUsed" "$SYSFS_PREFIX/sys/devices/system/node/node$1/meminfo" 2>/dev/null | awk '{print $4}')
     echo "$(( ${used_kb:-0} / 1024 ))"
 }
 
@@ -331,7 +335,7 @@ filter_cpus() {
             # shellcheck disable=SC2086
             [[ $range == *-* ]] && expanded_list=$(seq ${range%-*} ${range#*-}) || expanded_list=$range
             for cpu_id in $expanded_list; do
-                sibling_file="/sys/devices/system/cpu/cpu$cpu_id/topology/thread_siblings_list"
+                sibling_file="$SYSFS_PREFIX/sys/devices/system/cpu/cpu$cpu_id/topology/thread_siblings_list"
                 if [ -f "$sibling_file" ]; then
                     # shellcheck disable=SC2002
                     first_sibling=$(cat "$sibling_file" | cut -d',' -f1 | cut -d'-' -f1)
@@ -368,8 +372,8 @@ is_gaming_process() {
     fi
 
     # 3. Environment Variable Markers (Steam, Proton, Lutris, etc.)
-    if [ -r "/proc/$pid/environ" ]; then
-        if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qE "^(STEAM_COMPAT_APP_ID|STEAM_GAME_ID|LUTRIS_GAME_ID|HEROIC_APP_NAME|PROTON_VER|WINEPREFIX)="; then
+    if [ -r "$PROC_PREFIX/proc/$pid/environ" ]; then
+        if tr '\0' '\n' < "$PROC_PREFIX/proc/$pid/environ" 2>/dev/null | grep -qE "^(STEAM_COMPAT_APP_ID|STEAM_GAME_ID|LUTRIS_GAME_ID|HEROIC_APP_NAME|PROTON_VER|WINEPREFIX)="; then
             return 0
         fi
     fi
@@ -466,10 +470,10 @@ run_optimization() {
 
     for pid in $gpu_pids; do
         [[ -z "$pid" ]] && continue
-        if [ "$pid" -lt 100 ] || [ ! -d "/proc/$pid" ]; then continue; fi
+        if [ "$pid" -lt 100 ] || [ ! -d "$PROC_PREFIX/proc/$pid" ]; then continue; fi
         
         # Only optimize processes owned by the current user (unless root)
-        if [ "$EUID" -ne 0 ] && [ ! -O "/proc/$pid" ]; then
+        if [ "$EUID" -ne 0 ] && [ ! -O "$PROC_PREFIX/proc/$pid" ]; then
             continue
         fi
 
@@ -498,7 +502,7 @@ run_optimization() {
                 fi
             fi
 
-            local process_rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
+            local process_rss_kb=$(awk '/VmRSS/ {print $2}' "$PROC_PREFIX/proc/$pid/status" 2>/dev/null || echo 0)
             local safety_margin_kb=524288
 
             # Extract a simplified executable name for notifications
@@ -559,7 +563,7 @@ check_active_optimizations() {
             local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 
             for pid in $sorted_pids; do
-                if [ -d "/proc/$pid" ]; then
+                if [ -d "$PROC_PREFIX/proc/$pid" ]; then
                     local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
                     local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
                     local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
@@ -642,43 +646,45 @@ print_banner() {
 
 # --- Main Script Execution ---
 
-echo "------------------------------------------------------------------------------------------------"
-parse_args "$@"
-check_dependencies
-system_tune
-detect_target_user
-
-# Drop privileges if a target user was detected, we are root, and dropping is enabled
-if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
-    echo "--> Dropping privileges to $TargetUser..."
-    # Re-execute as the target user, skipping system-wide tuning in the child process
-    exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "${OriginalArgs[@]}"
-fi
-
-detect_gpu
-discover_resources
-filter_cpus
-
-print_banner
-if [ "$DaemonMode" = true ]; then
-    while true; do
-        run_optimization
-
-        # Aggregate notifications to avoid spamming the user
-        if [ ${#PendingOptimizations[@]} -gt 0 ]; then
-            log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
-            sleep $((SleepInterval + 5))
-            # Run one more time to catch immediate followers (e.g., game launcher -> game exe)
-            run_optimization
-            flush_notifications
-        fi
-
-        check_active_optimizations
-        sleep "$SleepInterval"
-    done
-else
-    run_optimization
-    flush_notifications
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "------------------------------------------------------------------------------------------------"
-    echo "Optimization complete."
+    parse_args "$@"
+    check_dependencies
+    system_tune
+    detect_target_user
+
+    # Drop privileges if a target user was detected, we are root, and dropping is enabled
+    if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
+        echo "--> Dropping privileges to $TargetUser..."
+        # Re-execute as the target user, skipping system-wide tuning in the child process
+        exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "${OriginalArgs[@]}"
+    fi
+
+    detect_gpu
+    discover_resources
+    filter_cpus
+
+    print_banner
+    if [ "$DaemonMode" = true ]; then
+        while true; do
+            run_optimization
+
+            # Aggregate notifications to avoid spamming the user
+            if [ ${#PendingOptimizations[@]} -gt 0 ]; then
+                log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
+                sleep $((SleepInterval + 5))
+                # Run one more time to catch immediate followers (e.g., game launcher -> game exe)
+                run_optimization
+                flush_notifications
+            fi
+
+            check_active_optimizations
+            sleep "$SleepInterval"
+        done
+    else
+        run_optimization
+        flush_notifications
+        echo "------------------------------------------------------------------------------------------------"
+        echo "Optimization complete."
+    fi
 fi
