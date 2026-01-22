@@ -16,7 +16,7 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **⚡ System-Level Tuning:** Optimizes kernel parameters (`sysctl`) for reduced scheduling latency and improved memory mapping.
 - **🛡️ Cross-Vendor Support:** Seamlessly works with NVIDIA, AMD, and Intel GPUs.
 - **🔄 Smart Daemon Mode:** Silently monitors your system, optimizing new games as they launch and providing periodic status summaries.
-- **🔔 Desktop Notifications:** Stay informed when a process is optimized via clean system notifications.
+- **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
 - **🧬 Nearby Node Support:** If the local node is full, it intelligently expands to the next closest nodes based on hardware distance.
 
 ---
@@ -86,6 +86,13 @@ If run as root, the script applies several system-level tweaks to reduce micro-s
 - **`kernel.nmi_watchdog=0`**: Disables the NMI watchdog to reduce periodic interrupts and improve latency consistency.
 - **Transparent Hugepages (THP)**: Set to `never` to prevent micro-stutters and stalls during dynamic allocation and defragmentation.
 - **CPU Scaling Governor**: Automatically sets all cores to `performance` mode to prevent downclocking during gameplay.
+
+### 5. Smart Notification Aggregation
+To prevent notification spam during complex game launches (e.g., Wine/Proton games starting `wineserver`, `explorer.exe`, and the game itself), the script implements a buffering system:
+- **Delayed Delivery**: When a new optimization is detected, the daemon waits `SleepInterval + 5` seconds to catch any subsequent processes.
+- **Amalgamated Messaging**: All processes optimized within that window are grouped into a single notification.
+- **Primary Process Highlighting**: The final and most prominent process (usually the game executable) is highlighted as the primary optimization in the message.
+- **Warning Propagation**: If any single process in a batch fails migration or encounters full nodes, the entire notification is upgraded to a warning icon.
 
 ---
 

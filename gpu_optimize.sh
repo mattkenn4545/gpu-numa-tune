@@ -22,6 +22,9 @@ TotalOptimizedCount=0
 LastSummaryTime=$(date +%s)
 SummaryInterval=600 # 10 minutes
 
+# Buffer for pending notifications to avoid spam
+declare -a PendingOptimizations
+
 # Save original arguments for re-execution after privilege dropping
 OriginalArgs=("$@")
 
@@ -109,6 +112,43 @@ notify_user() {
             notify-send -a "GPU NUMA Optimizer" -i "$icon" "$title" "$message" >/dev/null 2>&1
         fi
     fi
+}
+
+flush_notifications() {
+    [ ${#PendingOptimizations[@]} -eq 0 ] && return
+
+    local count=${#PendingOptimizations[@]}
+    local primary_idx=$((count - 1))
+    local primary_data="${PendingOptimizations[$primary_idx]}"
+    
+    IFS='|' read -r p_pid p_comm p_simplified p_status p_nodes <<< "$primary_data"
+    
+    local title=""
+    local message=""
+    local icon="dialog-information"
+    
+    if [ "$count" -eq 1 ]; then
+        title="$p_comm (PID: $p_pid): $p_status"
+        message="$p_simplified\n\nCPU affinity set and memory handled on Nodes $p_nodes"
+        [[ "$p_status" == *"FAILED"* || "$p_status" == *"FULL"* ]] && icon="dialog-warning"
+    else
+        title="Optimized $p_simplified ($p_comm) + $((count - 1)) additional processes"
+        message="$p_status on Nodes $p_nodes \n\n"
+        message+="Additional processes: \n"
+
+        for (( i=0; i < primary_idx; i++ )); do
+            IFS='|' read -r o_pid o_comm o_simplified o_status o_nodes <<< "${PendingOptimizations[$i]}"
+            message+="- $o_simplified ($o_comm): $p_status\n"
+            [[ "$o_status" == *"FAILED"* || "$o_status" == *"FULL"* ]] && icon="dialog-warning"
+        done
+
+        [[ "$p_status" == *"FAILED"* || "$p_status" == *"FULL"* ]] && icon="dialog-warning"
+    fi
+
+    notify_user "$title" "$message" "$icon"
+    
+    # Clear the buffer
+    PendingOptimizations=()
 }
 
 log() {
@@ -481,15 +521,15 @@ run_optimization() {
             if [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
                 if migratepages "$pid" all "${nearby_node_ids:-$numa_node_id}" > /dev/null 2>&1; then
                     status_msg="OPTIMIZED & MOVED"
-                    notify_user "$proc_comm (PID: $pid): Optimized " "$simplified_cmd\n\nCPU affinity set and memory migrated to Nodes $nearby_node_ids" "dialog-information"
                 else
                     status_msg="OPTIMIZED (MOVE FAILED)"
-                    notify_user "$proc_comm (PID: $pid): Migration Failed " "$simplified_cmd\n\nCPU affinity set, but memory migration to Nodes $nearby_node_ids failed" "dialog-warning"
                 fi
             else
                 status_msg="OPTIMIZED (NODE FULL)"
-                notify_user "$proc_comm (PID: $pid): Nodes Full " "$simplified_cmd\n\nCPU affinity set, but target NUMA nodes $nearby_node_ids are full" "dialog-warning"
             fi
+
+            # Queue for notification
+            PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${nearby_node_ids:-$numa_node_id}")
 
             printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
         else
@@ -539,11 +579,23 @@ check_active_optimizations() {
 if [ "$DaemonMode" = true ]; then
     while true; do
         run_optimization
+        
+        # If we optimized something, wait SleepInterval + 5 before notifying
+        # to catch any subsequent processes (e.g. game launcher -> game exe)
+        if [ ${#PendingOptimizations[@]} -gt 0 ]; then
+            log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
+            sleep $((SleepInterval + 5))
+            # Run one more time to catch immediate followers before flushing
+            run_optimization
+            flush_notifications
+        fi
+
         check_active_optimizations
         sleep "$SleepInterval"
     done
 else
     run_optimization
+    flush_notifications
     echo "------------------------------------------------------------------------------------------------"
     echo "Optimization complete."
 fi
