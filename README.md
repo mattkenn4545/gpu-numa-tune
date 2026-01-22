@@ -18,6 +18,7 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **🔄 Smart Daemon Mode:** Silently monitors your system, optimizing new games as they launch and providing periodic status summaries.
 - **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
 - **🧬 Nearby Node Support:** If the local node is full, it intelligently expands to the next closest nodes based on hardware distance.
+- **📊 Real-time Monitoring:** Provides periodic status summaries of all optimized processes.
 
 ---
 
@@ -48,7 +49,7 @@ sudo dnf install pciutils psmisc util-linux numactl procps-ng libnotify
 Getting up and running takes seconds:
 
 ```bash
-git clone https://github.com/your-repo/gpu-numa-tune.git
+git clone https://github.com/mattkenn4545/gpu-numa-tune.git
 cd gpu-numa-tune
 sudo ./install.sh
 ```
@@ -58,6 +59,9 @@ The installer will copy the script to `/usr/local/bin`, set up a systemd service
 ### 3. Tweaking Settings
 
 The optimizer is designed to work out-of-the-box, but you can customize its behavior by editing the systemd service file or running the script manually.
+
+**Usage:**
+`sudo ./gpu_optimize.sh [options] [gpu_index]`
 
 **Common Options:**
 - `-p, --physical-only`: Skip SMT/Hyper-threading siblings (often better for gaming).
