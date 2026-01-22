@@ -1,14 +1,18 @@
 [Unit]
 Description=GPU NUMA Node Affinity Optimizer
-After=network.target nvidia-persistenced.service
+After=network.target nvidia-persistenced.service graphical.target
+Wants=nvidia-persistenced.service
 
 [Service]
 Type=simple
-# Adjust flags here: -d for daemon, -p if you want physical cores only
-# If you have multiple GPUs and want a specific one, add the index (e.g., 0)
+# Standard options:
+# -d: daemon mode (required for service)
+# -p: physical cores only
+# -s: strict memory policy
+# -a: optimize all GPU processes (not just games)
 ExecStart=/usr/local/bin/gpu_optimize.sh -d
 Restart=always
-RestartSec=5
+RestartSec=10
 User=root
 
 [Install]
