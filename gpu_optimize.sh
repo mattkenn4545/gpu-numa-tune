@@ -16,6 +16,12 @@ OnlyGaming=true
 SkipSystemTune=false
 DropPrivs=true
 
+# Tracking for optimized processes
+declare -A OptimizedPidsMap
+TotalOptimizedCount=0
+LastSummaryTime=$(date +%s)
+SummaryInterval=600 # 10 minutes
+
 # Save original arguments for re-execution after privilege dropping
 OriginalArgs=("$@")
 
@@ -276,10 +282,12 @@ else
     IFS=',' read -ra cpu_ranges <<< "$raw_cpu_list"
     for range in "${cpu_ranges[@]}"; do
         [ -z "$range" ] && continue
+        # shellcheck disable=SC2086
         [[ $range == *-* ]] && expanded_list=$(seq ${range%-*} ${range#*-}) || expanded_list=$range
         for cpu_id in $expanded_list; do
             sibling_file="/sys/devices/system/cpu/cpu$cpu_id/topology/thread_siblings_list"
             if [ -f "$sibling_file" ]; then
+                # shellcheck disable=SC2002
                 first_sibling=$(cat "$sibling_file" | cut -d',' -f1 | cut -d'-' -f1)
                 [[ "$cpu_id" -eq "$first_sibling" ]] && final_cpu_mask+="$cpu_id,"
             fi
@@ -289,22 +297,27 @@ else
 fi
 
 normalize_affinity() {
+    # shellcheck disable=SC2162
     echo "$1" | tr ',' '\n' | while read r; do
+        # shellcheck disable=SC2086
         if [[ $r == *-* ]]; then seq ${r%-*} ${r#*-}; else echo $r; fi
     done | sort -n | tr '\n' ',' | sed 's/,$//'
 }
 
 get_node_free_kb() {
+    # shellcheck disable=SC2086
     local free_kb=$(grep -i "Node $1 MemFree" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
     echo "${free_kb:-0}"
 }
 
 get_node_total_mb() {
+    # shellcheck disable=SC2086
     local total_kb=$(grep -i "Node $1 MemTotal" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
     echo "$(( ${total_kb:-0} / 1024 ))"
 }
 
 get_node_used_mb() {
+    # shellcheck disable=SC2086
     local used_kb=$(grep -i "Node $1 MemUsed" /sys/devices/system/node/node$1/meminfo 2>/dev/null | awk '{print $4}')
     echo "$(( ${used_kb:-0} / 1024 ))"
 }
@@ -396,6 +409,9 @@ run_optimization() {
         local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
         [ -z "$raw_current_affinity" ] && continue
         local current_normalized_mask=$(normalize_affinity "$raw_current_affinity")
+        local proc_comm=$(ps -p "$pid" -o comm=)
+        local full_proc_cmd=$(ps -fp "$pid" -o args= | tail -n 1)
+        [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
         if [ "$current_normalized_mask" != "$target_normalized_mask" ]; then
             taskset -pc "$final_cpu_mask" "$pid" > /dev/null 2>&1
@@ -415,11 +431,6 @@ run_optimization() {
 
             local process_rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
             local safety_margin_kb=524288
-
-            local proc_comm=$(ps -p "$pid" -o comm=)
-
-            local full_proc_cmd=$(ps -fp "$pid" -o args= | tail -n 1)
-            [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
             # Extract the executable name (head of the command) for cleaner notifications
             # We handle Windows paths and potential spaces in the executable path (common in Steam/Proton)
@@ -456,14 +467,54 @@ run_optimization() {
             fi
 
             printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
+        else
+            # Already optimized
+            if [ -z "${OptimizedPidsMap[$pid]}" ]; then
+                # If we are in startup phase or just noticed it, print it
+                printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED" "$full_proc_cmd"
+            fi
+        fi
+
+        if [ -z "${OptimizedPidsMap[$pid]}" ]; then
+            OptimizedPidsMap[$pid]=$(date +%s)
+            ((TotalOptimizedCount++))
         fi
     done
+}
+
+check_active_optimizations() {
+    local now=$(date +%s)
+    if [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
+        echo "------------------------------------------------------------------------------------------------"
+        echo "PERIODIC STATUS SUMMARY ($(date "+%Y-%m-%d %H:%M:%S")) - $TotalOptimizedCount processes optimized since startup"
+        printf "%-8s | %-15s | %-18s | %-25s | %s\n" "PID" "EXE" "ORIG. AFFINITY" "STATUS" "COMMAND"
+        echo "------------------------------------------------------------------------------------------------"
+        
+        # Sort PIDs numerically for consistent output
+        local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
+
+        for pid in $sorted_pids; do
+            if [ -d "/proc/$pid" ]; then
+                local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
+                local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+                local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
+                [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
+
+                printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
+            else
+                unset "OptimizedPidsMap[$pid]"
+            fi
+        done
+        echo "------------------------------------------------------------------------------------------------"
+        LastSummaryTime=$now
+    fi
 }
 
 # 6. Execution Loop
 if [ "$DaemonMode" = true ]; then
     while true; do
         run_optimization
+        check_active_optimizations
         sleep "$SleepInterval"
     done
 else
