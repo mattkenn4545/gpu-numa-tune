@@ -91,7 +91,7 @@ If run as root, the script applies several system-level tweaks to reduce micro-s
 To prevent notification spam during complex game launches (e.g., Wine/Proton games starting `wineserver`, `explorer.exe`, and the game itself), the script implements a buffering system:
 - **Delayed Delivery**: When a new optimization is detected, the daemon waits `SleepInterval + 5` seconds to catch any subsequent processes.
 - **Amalgamated Messaging**: All processes optimized within that window are grouped into a single notification.
-- **Primary Process Highlighting**: The final and most prominent process (usually the game executable) is highlighted as the primary optimization in the message.
+- **Primary Process Highlighting**: The process with the largest memory footprint (RSS) is automatically identified as the primary process and highlighted in the notification. This ensures the actual game is prioritized over helper processes like `wineserver`.
 - **Warning Propagation**: If any single process in a batch fails migration or encounters full nodes, the entire notification is upgraded to a warning icon.
 
 ---

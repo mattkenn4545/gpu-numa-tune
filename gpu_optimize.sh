@@ -117,11 +117,24 @@ notify_user() {
 flush_notifications() {
     [ ${#PendingOptimizations[@]} -eq 0 ] && return
 
-    local count=${#PendingOptimizations[@]}
-    local primary_idx=$((count - 1))
-    local primary_data="${PendingOptimizations[$primary_idx]}"
+    # Sort pending optimizations by RSS size (last field) descending
+    # We use a temporary array to store sorted results
+    local sorted_pending=()
+    if [ ${#PendingOptimizations[@]} -gt 1 ]; then
+        # Use printf to handle potential spaces and pipe to sort
+        # Fields: pid|comm|simplified|status|nodes|rss
+        local IFS_BACKUP=$IFS
+        IFS=$'\n'
+        sorted_pending=($(printf "%s\n" "${PendingOptimizations[@]}" | sort -t'|' -k6,6rn))
+        IFS=$IFS_BACKUP
+    else
+        sorted_pending=("${PendingOptimizations[@]}")
+    fi
+
+    local count=${#sorted_pending[@]}
+    local primary_data="${sorted_pending[0]}"
     
-    IFS='|' read -r p_pid p_comm p_simplified p_status p_nodes <<< "$primary_data"
+    IFS='|' read -r p_pid p_comm p_simplified p_status p_nodes p_rss <<< "$primary_data"
     
     local title=""
     local message=""
@@ -136,9 +149,9 @@ flush_notifications() {
         message="$p_status on Nodes $p_nodes \n\n"
         message+="Additional processes: \n"
 
-        for (( i=0; i < primary_idx; i++ )); do
-            IFS='|' read -r o_pid o_comm o_simplified o_status o_nodes <<< "${PendingOptimizations[$i]}"
-            message+="- $o_simplified ($o_comm): $p_status\n"
+        for (( i=1; i < count; i++ )); do
+            IFS='|' read -r o_pid o_comm o_simplified o_status o_nodes o_rss <<< "${sorted_pending[$i]}"
+            message+="- $o_simplified ($o_comm): $o_status\n"
             [[ "$o_status" == *"FAILED"* || "$o_status" == *"FULL"* ]] && icon="dialog-warning"
         done
 
@@ -529,7 +542,7 @@ run_optimization() {
             fi
 
             # Queue for notification
-            PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${nearby_node_ids:-$numa_node_id}")
+            PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${nearby_node_ids:-$numa_node_id}|$process_rss_kb")
 
             printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
         else
