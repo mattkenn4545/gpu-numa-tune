@@ -25,20 +25,23 @@
 # ==============================================================================
 
 # --- Configuration ---
-UseHt=true              # Use SMT/HT sibling cores (Hyper-Threading)
-DaemonMode=false        # If true, monitor and optimize processes continuously
-SleepInterval=10        # Seconds to wait between process checks in daemon mode
-StrictMem=false         # true = use 'membind' (fails if node full), false = use 'preferred'
-IncludeNearby=true      # If true, include "nearby" NUMA nodes in addition to the closest one
-MaxDist=11              # Maximum distance value from 'numactl -H' to consider a node "nearby"
-OnlyGaming=true         # If true, only optimize processes identified as games or high-perf apps
-SkipSystemTune=false    # If true, do not attempt to modify sysctl or CPU governors
-DryRun=false            # If true, log intended changes but do not apply them
-DropPrivs=true          # If true, drop from root to the logged-in user after system tuning
+UseHt=true                   # Use SMT/HT sibling cores (Hyper-Threading)
+DaemonMode=false             # If true, monitor and optimize processes continuously
+SleepInterval=10             # Seconds to wait between process checks in daemon mode
+StrictMem=false              # true = use 'membind' (fails if node full), false = use 'preferred'
+IncludeNearby=true           # If true, include "nearby" NUMA nodes in addition to the closest one
+MaxDist=11                   # Maximum distance value from 'numactl -H' to consider a node "nearby"
+OnlyGaming=true              # If true, only optimize processes identified as games or high-perf apps
+SkipSystemTune=false         # If true, do not attempt to modify sysctl or CPU governors
+DryRun=false                 # If true, log intended changes but do not apply them
+DropPrivs=true               # If true, drop from root to the logged-in user after system tuning
+MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time optimization log
 
 # State Tracking
 declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
 TotalOptimizedCount=0        # Total number of unique processes optimized since script start
+AllTimeFile=""               # Path to the all-time tracking file
+AllTimeOptimizedCount=0      # Total number of unique processes optimized across all runs
 LastSummaryTime=$(date +%s)  # Timestamp of the last periodic summary report
 SummaryInterval=1800         # Interval between periodic summary reports (seconds)
 LogLineCount=9999            # Counter to track when to re-print table headers
@@ -103,6 +106,7 @@ usage() {
     echo "  -x, --no-tune        Skip system-level tuning (sysctl, etc.)"
     echo "  -n, --dry-run        Dry-run mode (don't apply any changes)"
     echo "  -k, --no-drop        Keep root privileges (do not drop to user)"
+    echo "  -m, --max-log-lines  Maximum all-time log lines (default: $MaxAllTimeLogLines)"
     echo "  -h, --help           Show this help message"
     echo
     echo "Arguments:"
@@ -609,25 +613,34 @@ run_optimization() {
             # Queue for notification
             PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${NearbyNodeIds:-$NumaNodeId}|$process_rss_kb")
             status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
+
+            if [ -z "${OptimizedPidsMap[$pid]}" ]; then
+                ((TotalOptimizedCount++))
+                ((AllTimeOptimizedCount++))
+                if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
+                    # Log entry format: TIMESTAMP | PID | COMM | STATUS | NODES | COMMAND
+                    printf "%-19s | %-8s | %-16s | %-22s | %-8s | %s\n" \
+                        "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$status_msg" "${NearbyNodeIds:-$NumaNodeId}" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
+                    trim_all_time_log
+                fi
+            fi
+            OptimizedPidsMap[$pid]=$(date +%s)
         else
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 local status_msg="OPTIMIZED"
                 [ "$DryRun" = true ] && status_msg="DRY RUN ($status_msg)"
                 status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
+                OptimizedPidsMap[$pid]=$(date +%s)
             fi
-        fi
-
-        if [ -z "${OptimizedPidsMap[$pid]}" ]; then
-            OptimizedPidsMap[$pid]=$(date +%s)
-            ((TotalOptimizedCount++))
         fi
     done
 }
 
 # Periodically prints a summary of optimized processes
 check_active_optimizations() {
+    local force_summary=${1:-false}
     local now=$(date +%s)
-    if [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
+    if [ "$force_summary" = true ] || [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
         # Sort PIDs numerically for consistent output
         local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 
@@ -650,13 +663,49 @@ check_active_optimizations() {
             summary_msg="No processes currently optimized"
         fi
 
-        status_log "$TotalOptimizedCount procs" "since startup" "---" "OPTIMIZED" "$summary_msg"
+        status_log "$TotalOptimizedCount procs" "since startup" "$AllTimeOptimizedCount all time" "OPTIMIZED" "$summary_msg"
 
         LastSummaryTime=$now
     fi
 }
 
 # --- CLI & Startup ---
+
+# Loads the all-time optimization count from the user's home directory.
+load_all_time_stats() {
+    local target_home=""
+    if [ -n "$TargetUser" ]; then
+        target_home=$(getent passwd "$TargetUser" | cut -d: -f6)
+    fi
+    [ -z "$target_home" ] && target_home="$HOME"
+
+    if [ -n "$target_home" ]; then
+        AllTimeFile="${target_home}/.gpu_numa_optimizations"
+        if [ -f "$AllTimeFile" ]; then
+            AllTimeOptimizedCount=$(wc -l < "$AllTimeFile" 2>/dev/null || echo 0)
+            # Ensure it's a number
+            [[ "$AllTimeOptimizedCount" =~ ^[0-9]+$ ]] || AllTimeOptimizedCount=0
+        fi
+    fi
+}
+
+# Trims the all-time optimization log if it exceeds the maximum allowed lines.
+# It uses a 50-line buffer to minimize full-file rewrites.
+trim_all_time_log() {
+    [ -z "$AllTimeFile" ] || [ ! -f "$AllTimeFile" ] && return
+    
+    local current_lines=$AllTimeOptimizedCount
+    # Only trim if we exceed the limit by more than 50 lines to reduce IO
+    if [ "$current_lines" -gt $((MaxAllTimeLogLines + 50)) ]; then
+        local temp_file="${AllTimeFile}.tmp"
+        if tail -n "$MaxAllTimeLogLines" "$AllTimeFile" > "$temp_file" 2>/dev/null; then
+            mv "$temp_file" "$AllTimeFile"
+            AllTimeOptimizedCount=$MaxAllTimeLogLines
+        else
+            rm -f "$temp_file"
+        fi
+    fi
+}
 
 # Parses command-line arguments and sets configuration variables
 parse_args() {
@@ -670,6 +719,7 @@ parse_args() {
             -x|--no-tune) SkipSystemTune=true; shift ;;
             -n|--dry-run) DryRun=true; shift ;;
             -k|--no-drop) DropPrivs=false; shift ;;
+            -m|--max-log-lines) MaxAllTimeLogLines=$2; shift 2 ;;
             -h|--help) usage ;;
             -*) echo "Unknown option: $1" ; usage ;;
             *) GpuIndexArg=$1; shift ;;
@@ -747,8 +797,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     detect_gpu
     discover_resources
     filter_cpus
+    load_all_time_stats
 
     print_banner
+    check_active_optimizations true
     if [ "$DaemonMode" = true ]; then
         # Continuous monitoring loop
         while true; do

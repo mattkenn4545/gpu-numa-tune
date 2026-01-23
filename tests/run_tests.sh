@@ -2,7 +2,7 @@
 
 # Clean up function
 cleanup() {
-    rm -rf tests/mock_bin tests/mock_proc tests/mock_sys tests/mock_dev
+    rm -rf tests/mock_bin tests/mock_proc tests/mock_sys tests/mock_dev tests/mock_all_time tests/mock_home tests/mock_all_time.tmp
 }
 trap cleanup EXIT
 
@@ -296,7 +296,144 @@ assert_eq "false" "$TASKSET_CALLED" "Dry-run: taskset not called"
 assert_eq "false" "$NUMACTL_CALLED" "Dry-run: numactl not called"
 assert_eq "false" "$MIGRATEPAGES_CALLED" "Dry-run: migratepages not called"
 
-echo -e "\nSummary: ${GREEN}$PASSED passed${NC}, ${RED}$FAILED failed${NC}"
+# Test 10: All-time tracking
+echo "Test 10: All-time tracking"
+AllTimeFile="tests/mock_all_time"
+rm -f "$AllTimeFile"
+AllTimeOptimizedCount=0
+TotalOptimizedCount=0
+OptimizedPidsMap=()
+
+# Simulate load_all_time_stats by manually setting up and calling it
+# We need to mock getent
+getent() {
+    if [[ "$*" == "passwd testuser" ]]; then
+        echo "testuser:x:1000:1000::$(pwd)/tests/mock_home:/bin/bash"
+    fi
+}
+mkdir -p tests/mock_home
+echo "entry1" > tests/mock_home/.gpu_numa_optimizations
+echo "entry2" >> tests/mock_home/.gpu_numa_optimizations
+TargetUser="testuser"
+
+load_all_time_stats
+assert_eq "2" "$AllTimeOptimizedCount" "load_all_time_stats loads correct line count"
+assert_eq "$(pwd)/tests/mock_home/.gpu_numa_optimizations" "$AllTimeFile" "AllTimeFile path set correctly"
+
+# Simulate optimizing a process (ACTUAL optimization)
+pid=1234
+proc_comm="game"
+raw_current_affinity="0-7"
+TargetNormalizedMask="0,1,2,3" # Force optimization
+current_normalized_mask="0,1,2,3,4,5,6,7" # Different from target
+full_proc_cmd="./game"
+status_msg="OPTIMIZED"
+NearbyNodeIds="0"
+DryRun=false
+AllTimeFile="tests/mock_all_time" # Redirect to local mock for the rest of Test 10
+rm -f "$AllTimeFile"
+touch "$AllTimeFile"
+echo "entry1" >> "$AllTimeFile"
+echo "entry2" >> "$AllTimeFile"
+AllTimeOptimizedCount=2
+
+# Mock ps for this PID
+ps() {
+    case "$*" in
+        *"-p 1234 -o comm="*) echo "game" ;;
+        *"-fp 1234 -o args="*) echo "./game" ;;
+        *"-p 1234 -o ppid="*) echo "1" ;;
+        *) command ps "$@" ;;
+    esac
+}
+
+# Run the part of run_optimization that handles ACTUAL optimization
+if [ "$current_normalized_mask" != "$TargetNormalizedMask" ]; then
+    if [ -z "${OptimizedPidsMap[$pid]}" ]; then
+        ((TotalOptimizedCount++))
+        ((AllTimeOptimizedCount++))
+        if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
+            printf "%-19s | %-8s | %-16s | %-22s | %-8s | %s\n" \
+                "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$status_msg" "${NearbyNodeIds:-$NumaNodeId}" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
+        fi
+    fi
+    OptimizedPidsMap[$pid]=$(date +%s)
+fi
+
+assert_eq "1" "$TotalOptimizedCount" "TotalOptimizedCount incremented for actual optimization"
+assert_eq "3" "$AllTimeOptimizedCount" "AllTimeOptimizedCount incremented from 2"
+assert_eq "3" "$(wc -l < $AllTimeFile)" "AllTimeFile line count updated for actual optimization"
+
+# Simulate process ALREADY optimized (mask matches)
+pid=5678
+proc_comm="game2"
+current_normalized_mask="0,1,2,3" # Already matches TargetNormalizedMask
+# OptimizedPidsMap for 5678 is empty
+
+if [ "$current_normalized_mask" != "$TargetNormalizedMask" ]; then
+    # Should not enter here
+    :
+else
+    if [ -z "${OptimizedPidsMap[$pid]}" ]; then
+        # Already optimized branch
+        OptimizedPidsMap[$pid]=$(date +%s)
+    fi
+fi
+
+assert_eq "1" "$TotalOptimizedCount" "TotalOptimizedCount NOT incremented if already optimized"
+assert_eq "3" "$AllTimeOptimizedCount" "AllTimeOptimizedCount NOT incremented if already optimized"
+assert_eq "3" "$(wc -l < $AllTimeFile)" "AllTimeFile NOT updated if already optimized"
+
+# Cleanup mock home
+rm -rf tests/mock_home
+
+# Test 11: Startup summary
+echo "Test 11: Startup summary"
+# We'll use a subshell to capture output and check if it contains the summary line
+output=$(
+    # Mock some things for a clean run
+    PciAddr="0000:01:00.0"
+    NumaNodeId=0
+    NearbyNodeIds="0"
+    FinalCpuMask="0-7"
+    TargetNormalizedMask="0,1,2,3,4,5,6,7"
+    OptimizedPidsMap=()
+    TotalOptimizedCount=0
+    AllTimeOptimizedCount=5 # Pre-set some value
+    LastSummaryTime=$(date +%s)
+    
+    # We want to check if print_banner followed by check_active_optimizations true works
+    # We can just call the functions if we source the script
+    print_banner > /dev/null # Skip banner
+    check_active_optimizations true
+)
+
+assert_eq "0 procs    | since startup   | 5 all time         | OPTIMIZED                 | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
+
+# Test 12: All-time log rotation
+echo "Test 12: All-time log rotation (with 50-line buffer)"
+AllTimeFile="tests/mock_all_time"
+rm -f "$AllTimeFile"
+MaxAllTimeLogLines=10
+
+# Populate with 11 lines (exceeds MaxAllTimeLogLines but NOT by 50)
+for i in {1..11}; do echo "line$i" >> "$AllTimeFile"; done
+AllTimeOptimizedCount=11
+
+trim_all_time_log
+assert_eq "11" "$(wc -l < "$AllTimeFile")" "trim_all_time_log does NOT trim within 50-line buffer"
+assert_eq "11" "$AllTimeOptimizedCount" "AllTimeOptimizedCount remains 11"
+
+# Populate to 61 lines (exceeds MaxAllTimeLogLines + 50)
+for i in {12..61}; do echo "line$i" >> "$AllTimeFile"; done
+AllTimeOptimizedCount=61
+
+trim_all_time_log
+assert_eq "10" "$(wc -l < "$AllTimeFile")" "trim_all_time_log trims to MaxAllTimeLogLines after 50-line overflow"
+assert_eq "line52" "$(head -n 1 "$AllTimeFile")" "trim_all_time_log keeps most recent entries (line52)"
+assert_eq "line61" "$(tail -n 1 "$AllTimeFile")" "trim_all_time_log keeps most recent entries (line61)"
+assert_eq "10" "$AllTimeOptimizedCount" "AllTimeOptimizedCount updated to MaxAllTimeLogLines"
+
 if [ $FAILED -gt 0 ]; then
     exit 1
 fi

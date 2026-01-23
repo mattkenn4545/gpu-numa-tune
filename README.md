@@ -18,6 +18,7 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes.
 - **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
 - **🧬 Nearby Node Support:** If the local node is full, it intelligently expands to the next closest nodes based on hardware distance.
+- **📈 All-Time Tracking:** Maintains a persistent log of every optimization across reboots, providing historical insights into your system's performance tuning.
 - **📊 Real-time Monitoring:** Provides periodic status summaries of all optimized processes.
 
 ---
@@ -71,6 +72,7 @@ The optimizer is designed to work out-of-the-box, but you can customize its beha
 - `-a, --all-gpu-procs`: Optimize *every* process using the GPU, not just games.
 - `-x, --no-tune`: Skip system-level kernel tuning (sysctl, etc.).
 - `-n, --dry-run`: Dry-run mode. Don't apply any changes, just show what would be done.
+- `-m, --max-log-lines`: Set the maximum number of lines for the all-time optimization log (default: 10000).
 - `-k, --no-drop`: Do not drop root privileges (useful for certain troubleshooting).
 - `-h, --help`: Show full usage information.
 
@@ -148,6 +150,12 @@ To prevent notification spam during complex game launches (e.g., Wine/Proton gam
 - **Primary Process Highlighting**: The process with the largest memory footprint (RSS) is automatically identified as the primary process and highlighted in the notification. This ensures the actual game is prioritized over helper processes like `wineserver`.
 - **Warning Propagation**: If any single process in a batch fails migration or encounters full nodes, the entire notification is upgraded to a warning icon.
 - **Automatic Summary**: In daemon mode, a periodic summary of all active optimizations and total session stats is logged to the system journal every 30 minutes.
+
+### 7. Persistent Tracking & Log Management
+To provide a long-term view of your system's performance tuning, the script maintains a persistent log file:
+- **`~/.gpu_numa_optimizations`**: A human-readable log file stored in the home directory of the user running the session. Each line records a unique optimization event with a timestamp, PID, process name, status, and target nodes.
+- **Atomic Log Trimming**: To prevent the log from growing indefinitely, it is automatically trimmed when it exceeds the configured limit (default: 10,000 lines). The script uses a 50-line buffer and atomic file operations to ensure log integrity while minimizing disk I/O.
+- **Global Stats**: The periodic status summary includes an "all-time" counter derived from this log, giving you a quick glance at how many processes have been optimized across all sessions.
 
 ---
 
