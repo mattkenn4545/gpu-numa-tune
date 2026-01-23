@@ -58,6 +58,7 @@ TargetGid=""                 # GID of the TargetUser
 # Global mock prefix for testing
 SYSFS_PREFIX="${SYSFS_PREFIX:-}"
 PROC_PREFIX="${PROC_PREFIX:-}"
+DEV_PREFIX="${DEV_PREFIX:-}"
 
 # Displays a formatted table row for process optimization status
 status_log() {
@@ -182,20 +183,43 @@ flush_notifications() {
 
 # Identifies the GPU's PCI address based on the provided index.
 detect_gpu() {
-    mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
+    # Preferred: GPUs with active render nodes
+    mapfile -t active_gpus < <(
+        for d in "$DEV_PREFIX"/dev/dri/renderD*; do
+            [ -e "$d" ] || continue
+            # Get PCI address from sysfs for this render node
+            # /dev/dri/renderD128 -> /sys/class/drm/renderD128/device
+            pci_path=$(readlink -f "$SYSFS_PREFIX/sys/class/drm/$(basename "$d")/device" 2>/dev/null)
+            if [[ "$pci_path" =~ ([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F])$ ]]; then
+                echo "${BASH_REMATCH[1]}"
+            fi
+        done | sort -u
+    )
+
+    # Fallback/Additional: Known GPU vendors if no render nodes or to complement
+    mapfile -t vendor_gpus < <(lspci -D | grep -iE "NVIDIA|Advanced Micro Devices|Intel Corporation" | grep -iE "VGA|3D" | awk '{print $1}')
+    
+    # Merge and deduplicate
+    mapfile -t all_gpu_pci < <(printf "%s\n" "${active_gpus[@]}" "${vendor_gpus[@]}" | grep -v "^$" | sort -u)
+
     GpuIndexArg=${GpuIndexArg:-0}
 
-    if [ "${#all_vga_devices[@]}" -eq 0 ]; then
-        echo "Error: No GPU (VGA/3D) devices detected via lspci."
+    if [ "${#all_gpu_pci[@]}" -eq 0 ]; then
+        # Last resort: any VGA/3D device
+        mapfile -t all_gpu_pci < <(lspci -D | grep -iE 'vga|3d' | awk '{print $1}')
+    fi
+
+    if [ "${#all_gpu_pci[@]}" -eq 0 ]; then
+        echo "Error: No GPU (VGA/3D) devices detected."
         exit 1
     fi
 
-    if [ "$GpuIndexArg" -ge "${#all_vga_devices[@]}" ]; then
-        echo "Error: GPU index $GpuIndexArg not found (Found ${#all_vga_devices[@]} GPUs)."
+    if [ "$GpuIndexArg" -ge "${#all_gpu_pci[@]}" ]; then
+        echo "Error: GPU index $GpuIndexArg not found (Found ${#all_gpu_pci[@]} GPUs)."
         exit 1
     fi
 
-    PciAddr=$(echo "${all_vga_devices[$GpuIndexArg]}" | awk '{print $1}')
+    PciAddr="${all_gpu_pci[$GpuIndexArg]}"
 
     if [ -z "$PciAddr" ]; then
         echo "Error: Could not determine PCI address for GPU index $GpuIndexArg."

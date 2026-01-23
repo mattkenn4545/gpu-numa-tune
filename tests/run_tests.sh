@@ -2,7 +2,7 @@
 
 # Clean up function
 cleanup() {
-    rm -rf tests/mock_bin tests/mock_proc tests/mock_sys
+    rm -rf tests/mock_bin tests/mock_proc tests/mock_sys tests/mock_dev
 }
 trap cleanup EXIT
 
@@ -207,14 +207,40 @@ filter_cpus
 assert_eq "0,1,2,3,4,5,6,7" "$TargetNormalizedMask" "filter_cpus HT allowed"
 
 # Test 8: detect_gpu
+# Mocking sysfs and dev for detect_gpu
+export DEV_PREFIX="$(pwd)/tests/mock_dev"
+mkdir -p "$DEV_PREFIX/dev/dri"
+touch "$DEV_PREFIX/dev/dri/renderD128"
+
+mkdir -p "$SYSFS_PREFIX/sys/class/drm/renderD128"
+# Note: readlink -f will resolve this in the real world, but our mock readlink handles it here
+ln -sf "$SYSFS_PREFIX/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0" "$SYSFS_PREFIX/sys/class/drm/renderD128/device"
+
 lspci() {
-    echo "0000:01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
-    echo "0000:41:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+    if [[ "$*" == "-D" ]]; then
+        # Include another GPU to test indexing
+        echo "0000:01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+        echo "0000:41:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+    else
+        echo "lspci mock: $*"
+    fi
 }
+
+readlink() {
+    if [[ "$*" == *"/sys/class/drm/renderD128/device" ]]; then
+        echo "0000:01:00.0"
+    else
+        command readlink "$@"
+    fi
+}
+
+GpuIndexArg=0
+detect_gpu
+assert_eq "0000:01:00.0" "$PciAddr" "detect_gpu index 0 (renderD128)"
 
 GpuIndexArg=1
 detect_gpu
-assert_eq "0000:41:00.0" "$PciAddr" "detect_gpu index 1"
+assert_eq "0000:41:00.0" "$PciAddr" "detect_gpu index 1 (lspci fallback)"
 
 # Test 9: Dry-run mode
 DryRun=true

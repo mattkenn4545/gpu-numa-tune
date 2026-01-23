@@ -1,7 +1,6 @@
 [Unit]
 Description=GPU NUMA Node Affinity Optimizer
-After=network.target nvidia-persistenced.service graphical.target
-Wants=nvidia-persistenced.service
+After=network.target graphical.target
 
 [Service]
 Type=simple
