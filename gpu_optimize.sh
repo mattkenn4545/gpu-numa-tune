@@ -810,8 +810,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             # If optimizations were performed, wait a short while for related processes
             # (e.g., a game launcher starting the game engine) to appear.
             if [ ${#PendingOptimizations[@]} -gt 0 ]; then
-                log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
-                sleep $((SleepInterval + 5))
+                log "Optimized ${#PendingOptimizations[@]} process(es). Waiting ${SleepInterval} to aggregate more..."
+                sleep $((SleepInterval))
                 # Run one more time to catch immediate followers
                 run_optimization
                 flush_notifications
