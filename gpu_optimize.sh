@@ -43,7 +43,10 @@ TotalOptimizedCount=0        # Total number of unique processes optimized since 
 AllTimeFile=""               # Path to the all-time tracking file
 AllTimeOptimizedCount=0      # Total number of unique processes optimized across all runs
 LastSummaryTime=$(date +%s)  # Timestamp of the last periodic summary report
+LastOptimizationTime=$(date +%s) # Timestamp of the last successful optimization
+SummarySilenced=false        # True if we have silenced periodic summaries due to inactivity
 SummaryInterval=1800         # Interval between periodic summary reports (seconds)
+SummarySilenceTimeout=7200   # Stop summary messages after 2 hours of inactivity
 LogLineCount=9999            # Counter to track when to re-print table headers
 HeaderInterval=20            # Number of log lines before repeating the table header
 
@@ -617,6 +620,8 @@ run_optimization() {
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 ((TotalOptimizedCount++))
                 ((AllTimeOptimizedCount++))
+                LastOptimizationTime=$(date +%s)
+                SummarySilenced=false
                 if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
                     # Log entry format: TIMESTAMP | PID | COMM | STATUS | NODES | COMMAND
                     printf "%-19s | %-8s | %-16s | %-22s | %-8s | %s\n" \
@@ -631,6 +636,8 @@ run_optimization() {
                 [ "$DryRun" = true ] && status_msg="DRY RUN ($status_msg)"
                 status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
                 OptimizedPidsMap[$pid]=$(date +%s)
+                LastOptimizationTime=$(date +%s)
+                SummarySilenced=false
             fi
         fi
     done
@@ -641,6 +648,18 @@ check_active_optimizations() {
     local force_summary=${1:-false}
     local now=$(date +%s)
     if [ "$force_summary" = true ] || [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
+        if [ "$force_summary" = false ] && [ $((now - LastOptimizationTime)) -ge "$SummarySilenceTimeout" ]; then
+            if [ "$SummarySilenced" = false ]; then
+                echo "------------------------------------------------------------------------------------------------"
+                echo "No processes optimized in $(($SummarySilenceTimeout / 3600)) hours. Silencing periodic summaries."
+                echo "Monitoring continues; summaries will resume if a qualifying process is detected."
+                echo "------------------------------------------------------------------------------------------------"
+                SummarySilenced=true
+            fi
+            LastSummaryTime=$now
+            return
+        fi
+
         # Sort PIDs numerically for consistent output
         local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 

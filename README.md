@@ -15,11 +15,11 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **🕹️ Gaming-Aware Heuristics:** Automatically identifies games from Steam, Proton, Wine, Lutris, and Heroic by inspecting environment variables and process ancestry, while ignoring background apps like browsers or Discord.
 - **⚡ System-Level Tuning:** Optimizes kernel parameters (`sysctl`), CPU governors, and Transparent Hugepages (THP) for reduced scheduling latency and improved memory mapping.
 - **🛡️ Cross-Vendor Support:** Seamlessly works with NVIDIA, AMD, and Intel GPUs.
-- **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes.
+- **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes. Summaries automatically silence after 2 hours of inactivity to keep your logs clean.
 - **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
 - **🧬 Nearby Node Support:** If the local node is full, it intelligently expands to the next closest nodes based on hardware distance.
 - **📈 All-Time Tracking:** Maintains a persistent log of every optimization across reboots, providing historical insights into your system's performance tuning.
-- **📊 Real-time Monitoring:** Provides periodic status summaries of all optimized processes.
+- **📊 Real-time Monitoring:** Provides periodic status summaries of all optimized processes, which automatically pause if no new activity is detected for 2 hours.
 
 ---
 
@@ -149,7 +149,7 @@ To prevent notification spam during complex game launches (e.g., Wine/Proton gam
 - **Amalgamated Messaging**: All processes optimized within that window are grouped into a single notification.
 - **Primary Process Highlighting**: The process with the largest memory footprint (RSS) is automatically identified as the primary process and highlighted in the notification. This ensures the actual game is prioritized over helper processes like `wineserver`.
 - **Warning Propagation**: If any single process in a batch fails migration or encounters full nodes, the entire notification is upgraded to a warning icon.
-- **Automatic Summary**: In daemon mode, a periodic summary of all active optimizations and total session stats is logged to the system journal every 30 minutes.
+- **Automatic Summary & Silencing**: In daemon mode, a periodic summary of all active optimizations and total session stats is logged to the system journal every 30 minutes. To avoid cluttering logs during long periods of inactivity, these summaries are automatically silenced after 2 hours if no new processes are optimized. They resume immediately once a qualifying process is detected.
 
 ### 7. Persistent Tracking & Log Management
 To provide a long-term view of your system's performance tuning, the script maintains a persistent log file:
