@@ -13,9 +13,9 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **🎯 Precision Pinning:** Automatically detects your GPU's physical NUMA node and pins game threads to the most efficient CPU cores.
 - **🧠 Intelligent Memory Migration:** Moves existing game memory allocations to the GPU's local NUMA node in real-time.
 - **🕹️ Gaming-Aware Heuristics:** Automatically identifies games from Steam, Proton, Wine, Lutris, and Heroic by inspecting environment variables and process ancestry, while ignoring background apps like browsers or Discord.
-- **⚡ System-Level Tuning:** Optimizes kernel parameters (`sysctl`) for reduced scheduling latency and improved memory mapping.
+- **⚡ System-Level Tuning:** Optimizes kernel parameters (`sysctl`), CPU governors, and Transparent Hugepages (THP) for reduced scheduling latency and improved memory mapping.
 - **🛡️ Cross-Vendor Support:** Seamlessly works with NVIDIA, AMD, and Intel GPUs.
-- **🔄 Smart Daemon Mode:** Silently monitors your system, optimizing new games as they launch and providing periodic status summaries.
+- **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes.
 - **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
 - **🧬 Nearby Node Support:** If the local node is full, it intelligently expands to the next closest nodes based on hardware distance.
 - **📊 Real-time Monitoring:** Provides periodic status summaries of all optimized processes.
@@ -65,7 +65,7 @@ The optimizer is designed to work out-of-the-box, but you can customize its beha
 
 **Common Options:**
 - `-p, --physical-only`: Skip SMT/Hyper-threading siblings (often better for gaming).
-- `-d, --daemon`: Run in daemon mode (periodically checks for new processes).
+- `-d, --daemon`: Run in daemon mode (periodically checks for new processes every 10s).
 - `-s, --strict`: Force memory to stay on the local node (OOM risk if node is small, but maximum performance).
 - `-l, --local-only`: Disable "nearby node" logic and stick strictly to the GPU's primary node.
 - `-a, --all-gpu-procs`: Optimize *every* process using the GPU, not just games.
@@ -73,6 +73,9 @@ The optimizer is designed to work out-of-the-box, but you can customize its beha
 - `-n, --dry-run`: Dry-run mode. Don't apply any changes, just show what would be done.
 - `-k, --no-drop`: Do not drop root privileges (useful for certain troubleshooting).
 - `-h, --help`: Show full usage information.
+
+**Arguments:**
+- `gpu_index`: The index of the GPU to target (default: 0). Use `lspci` to see your devices.
 
 **To edit the service settings:**
 1. Run `sudo systemctl edit --full gpu-numa-optimizer.service`
@@ -111,6 +114,7 @@ Unlike blind optimizers, this script uses surgical precision to find games:
     - Inspects `/proc/$pid/environ` for Steam, Proton, and Wine environment variables.
     - Uses `ps` to identify common game engines (Unity, Unreal) and launchers (Lutris, Heroic).
     - Checks process lineage to catch child processes spawned by game launchers.
+    - Filters out common non-gaming applications (browsers, Discord, etc.) and background services.
 
 ### 3. Execution & Memory Optimization
 Once a game is identified, the script applies three distinct optimizations:
@@ -126,9 +130,9 @@ To ensure maximum performance while maintaining security, the script handles pri
 
 ### 5. Kernel Latency Tuning
 If run as root, the script applies several system-level tweaks to reduce micro-stutter and ensure consistent performance:
-- **`kernel.numa_balancing=0`**: Disables the kernel's automatic NUMA balancer, which can cause unpredictable "stutters" when it moves memory behind the game's back.
+- **`kernel.numa_balancing=0`**: Disables the kernel's automatic NUMA balancer, which can cause unpredictable "stutters" when it moves memory behind the game's back. We handle placement manually for maximum consistency.
 - **`kernel.split_lock_mitigate=0`**: Disables split lock mitigation to prevent execution stalls in certain applications.
-- **`vm.max_map_count`**: Increased to `2147483647` to handle the heavy memory mapping requirements of modern AAA titles and Wine/Proton.
+- **`vm.max_map_count`**: Increased to `2147483647` (max) to handle the heavy memory mapping requirements of modern AAA titles (like Star Citizen) and Wine/Proton.
 - **`kernel.sched_migration_cost_ns`**: Tuned to `5000000` (5ms) to reduce unnecessary task migrations between cores.
 - **`net.core.netdev_max_backlog`**: Increased network receive queue to `5000` to prevent packet drops during heavy load.
 - **`net.core.busy_read/poll`**: Set to `50` for low-latency network polling for smoother online play.
@@ -143,6 +147,7 @@ To prevent notification spam during complex game launches (e.g., Wine/Proton gam
 - **Amalgamated Messaging**: All processes optimized within that window are grouped into a single notification.
 - **Primary Process Highlighting**: The process with the largest memory footprint (RSS) is automatically identified as the primary process and highlighted in the notification. This ensures the actual game is prioritized over helper processes like `wineserver`.
 - **Warning Propagation**: If any single process in a batch fails migration or encounters full nodes, the entire notification is upgraded to a warning icon.
+- **Automatic Summary**: In daemon mode, a periodic summary of all active optimizations and total session stats is logged to the system journal every 30 minutes.
 
 ---
 

@@ -25,33 +25,33 @@
 # ==============================================================================
 
 # --- Configuration ---
-UseHt=true              # Use SMT/HT sibling cores
-DaemonMode=false        # Run continuously
-SleepInterval=10        # Seconds between checks in daemon mode
-StrictMem=false         # true = membind (OOM risk), false = preferred
-IncludeNearby=true      # Include NUMA nodes within MaxDist
-MaxDist=11              # Max distance for "nearby" nodes
-OnlyGaming=true         # Filter for gaming-related processes
-SkipSystemTune=false    # Skip sysctl and governor changes
-DryRun=false            # Dry-run mode
-DropPrivs=true          # Drop root to user after system tuning
+UseHt=true              # Use SMT/HT sibling cores (Hyper-Threading)
+DaemonMode=false        # If true, monitor and optimize processes continuously
+SleepInterval=10        # Seconds to wait between process checks in daemon mode
+StrictMem=false         # true = use 'membind' (fails if node full), false = use 'preferred'
+IncludeNearby=true      # If true, include "nearby" NUMA nodes in addition to the closest one
+MaxDist=11              # Maximum distance value from 'numactl -H' to consider a node "nearby"
+OnlyGaming=true         # If true, only optimize processes identified as games or high-perf apps
+SkipSystemTune=false    # If true, do not attempt to modify sysctl or CPU governors
+DryRun=false            # If true, log intended changes but do not apply them
+DropPrivs=true          # If true, drop from root to the logged-in user after system tuning
 
 # State Tracking
-declare -A OptimizedPidsMap
-TotalOptimizedCount=0
-LastSummaryTime=$(date +%s)
-SummaryInterval=600     # Periodic summary interval (seconds)
-LogLineCount=9999       # Force header on first log
-HeaderInterval=20
+declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
+TotalOptimizedCount=0        # Total number of unique processes optimized since script start
+LastSummaryTime=$(date +%s)  # Timestamp of the last periodic summary report
+SummaryInterval=1800         # Interval between periodic summary reports (seconds)
+LogLineCount=9999            # Counter to track when to re-print table headers
+HeaderInterval=20            # Number of log lines before repeating the table header
 
 # Notification Buffer
-declare -a PendingOptimizations
+declare -a PendingOptimizations # Queue of optimization events waiting to be displayed to the user
 
 # Process Environment
-OriginalArgs=("$@")
-TargetUser=""
-TargetUid=""
-TargetGid=""
+OriginalArgs=("$@")          # Store original CLI arguments for privilege-dropped re-execution
+TargetUser=""                # Username of the logged-in graphical user
+TargetUid=""                 # UID of the TargetUser
+TargetGid=""                 # GID of the TargetUser
 
 # --- Utilities & Logging ---
 
@@ -109,7 +109,7 @@ usage() {
     exit 0
 }
 
-# Send desktop notification using notify-send
+# Send desktop notification using notify-send.
 notify_user() {
     local title="$1"
     local message="$2"
@@ -127,7 +127,9 @@ notify_user() {
     fi
 }
 
-# Processes and displays queued notifications
+# Processes and displays queued notifications.
+# This function sorts the queued optimizations by process RSS size and 
+# combines them into a single desktop notification to avoid user annoyance.
 flush_notifications() {
     [ ${#PendingOptimizations[@]} -eq 0 ] && return
 
@@ -178,7 +180,7 @@ flush_notifications() {
 
 # --- System Discovery & Hardware Info ---
 
-# Identifies the GPU's PCI address based on the provided index
+# Identifies the GPU's PCI address based on the provided index.
 detect_gpu() {
     mapfile -t all_vga_devices < <(lspci -D | grep -iE 'vga|3d')
     GpuIndexArg=${GpuIndexArg:-0}
@@ -227,7 +229,8 @@ discover_resources() {
     fi
 }
 
-# Returns a comma-separated list of NUMA nodes within MaxDist of the target node
+# Returns a comma-separated list of NUMA nodes within MaxDist of the target node.
+# This uses 'numactl --hardware' to determine the relative distance between nodes.
 get_nearby_nodes() {
     local target_node=$1
     local nearby=()
@@ -353,7 +356,13 @@ filter_cpus() {
 
 # --- Process Analysis & Filtering ---
 
-# Determines if a PID should be optimized based on its environment and command line
+# Determines if a PID should be optimized based on its environment and command line.
+# This function applies several layers of heuristics to identify games:
+# 1. Checks a blacklist of common desktop/system apps (browsers, shells, etc.).
+# 2. Looks for UI/Utility markers in process arguments (e.g., Chromium's --type=renderer).
+# 3. Searches for environment variables common to Steam, Proton, Lutris, and Heroic.
+# 4. Checks for binary names containing '.exe', 'wine', 'proton', or 'Game'.
+# 5. Inspects the parent process chain for known game launchers/runtimes.
 is_gaming_process() {
     local pid="$1"
 
@@ -412,6 +421,7 @@ system_tune() {
             local key="$1"
             local value="$2"
             local label="$3"
+            # Check if the sysctl key exists before attempting to set it
             if [ -f "/proc/sys/${key//./ /}" ] || sysctl "$key" >/dev/null 2>&1; then
                 if [ "$DryRun" = false ]; then
                     sysctl -w "$key=$value" >/dev/null
@@ -424,14 +434,24 @@ system_tune() {
             fi
         }
 
+        # vm.max_map_count: Increased for games with many memory mappings (e.g., Star Citizen, many Proton games)
         set_sysctl "vm.max_map_count" "2147483647" "Memory Mapping"
+        # kernel.numa_balancing: Disabled to prevent the kernel from automatically moving pages between NUMA nodes,
+        # which can cause inconsistent performance. We handle placement manually.
         set_sysctl "kernel.numa_balancing" "0" "NUMA Contention"
+        # kernel.split_lock_mitigate: Disabled to avoid performance penalties when a process performs split-locks.
         set_sysctl "kernel.split_lock_mitigate" "0" "Execution Latency"
+        # kernel.sched_migration_cost_ns: Increased to make the scheduler less aggressive about moving tasks
+        # between CPUs, which helps maintain cache locality.
         set_sysctl "kernel.sched_migration_cost_ns" "5000000" "Scheduler"
+        # net.core.netdev_max_backlog: Increased for better handling of high-speed network traffic.
         set_sysctl "net.core.netdev_max_backlog" "5000" "Network"
+        # Busy polling/reading: Lowers network latency for online games.
         set_sysctl "net.core.busy_read" "50" "Network Latency"
         set_sysctl "net.core.busy_poll" "50" "Network Latency"
+        # vm.stat_interval: Increased to reduce background "jitter" from virtual memory statistics gathering.
         set_sysctl "vm.stat_interval" "10" "Jitter Reduction"
+        # kernel.nmi_watchdog: Disabled to reduce periodic interrupts that can cause micro-stutters.
         set_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
 
         # Transparency Hugepages (THP): 'never' or 'madvise' reduces micro-stutters in games
@@ -680,6 +700,8 @@ print_banner() {
 
 # --- Main Script Execution ---
 
+# Entry point of the script. Handles initialization, privilege dropping, 
+# and enters the main daemon loop or performs a single-run optimization.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "------------------------------------------------------------------------------------------------"
     parse_args "$@"
@@ -687,10 +709,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     system_tune
     detect_target_user
 
-    # Drop privileges if a target user was detected, we are root, and dropping is enabled
+    # Drop privileges if a target user was detected, we are root, and dropping is enabled.
+    # This allows the script to perform system tuning as root, then switch to the user 
+    # context for monitoring and optimizing user-owned processes.
     if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
         echo "--> Dropping privileges to $TargetUser..."
-        # Re-execute as the target user, skipping system-wide tuning in the child process
+        # Re-execute the script as the target user. 
+        # --no-tune: Skip system_tune in the child as it requires root.
+        # --no-drop: Prevent infinite re-execution loops.
         exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "${OriginalArgs[@]}"
     fi
 
@@ -700,14 +726,17 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
     print_banner
     if [ "$DaemonMode" = true ]; then
+        # Continuous monitoring loop
         while true; do
             run_optimization
 
-            # Aggregate notifications to avoid spamming the user
+            # Aggregate notifications to avoid spamming the user.
+            # If optimizations were performed, wait a short while for related processes
+            # (e.g., a game launcher starting the game engine) to appear.
             if [ ${#PendingOptimizations[@]} -gt 0 ]; then
                 log "Optimized ${#PendingOptimizations[@]} process(es). Waiting $((SleepInterval + 5))s to aggregate more..."
                 sleep $((SleepInterval + 5))
-                # Run one more time to catch immediate followers (e.g., game launcher -> game exe)
+                # Run one more time to catch immediate followers
                 run_optimization
                 flush_notifications
             fi
@@ -716,6 +745,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             sleep "$SleepInterval"
         done
     else
+        # Single-run mode
         run_optimization
         flush_notifications
         echo "------------------------------------------------------------------------------------------------"
