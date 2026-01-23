@@ -33,6 +33,7 @@ IncludeNearby=true      # Include NUMA nodes within MaxDist
 MaxDist=11              # Max distance for "nearby" nodes
 OnlyGaming=true         # Filter for gaming-related processes
 SkipSystemTune=false    # Skip sysctl and governor changes
+DryRun=false            # Dry-run mode
 DropPrivs=true          # Drop root to user after system tuning
 
 # State Tracking
@@ -76,7 +77,7 @@ status_log() {
 
     [ -z "$pid" ] && return
 
-    printf "%-8s | %-15s | %-18s | %-25s | %s\n" "$pid" "$exe" "$affinity" "$status" "$cmd"
+    printf "%-10s | %-15s | %-18s | %-25s | %s\n" "$pid" "$exe" "$affinity" "$status" "$cmd"
     ((LogLineCount++))
 }
 
@@ -99,6 +100,7 @@ usage() {
     echo "  -l, --local-only     Use only the GPU's local NUMA node (ignore nearby nodes)"
     echo "  -a, --all-gpu-procs  Optimize ALL processes using the GPU (not just games)"
     echo "  -x, --no-tune        Skip system-level tuning (sysctl, etc.)"
+    echo "  -n, --dry-run        Dry-run mode (don't apply any changes)"
     echo "  -k, --no-drop        Keep root privileges (do not drop to user)"
     echo "  -h, --help           Show this help message"
     echo
@@ -411,8 +413,12 @@ system_tune() {
             local value="$2"
             local label="$3"
             if [ -f "/proc/sys/${key//./ /}" ] || sysctl "$key" >/dev/null 2>&1; then
-                sysctl -w "$key=$value" >/dev/null
-                printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$value" "$label"
+                if [ "$DryRun" = false ]; then
+                    sysctl -w "$key=$value" >/dev/null
+                    printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$value" "$label"
+                else
+                    printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$value" "$label"
+                fi
             else
                 printf "  [SKIP] %-28s (Not supported by kernel)\n" "$key"
             fi
@@ -430,20 +436,32 @@ system_tune() {
 
         # Transparency Hugepages (THP): 'never' or 'madvise' reduces micro-stutters in games
         if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
-            echo "never" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
-            printf "  [OK] %-30s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
+            if [ "$DryRun" = false ]; then
+                echo "never" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+                printf "  [OK] %-30s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
+            else
+                printf "  [DRY] %-29s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
+            fi
         fi
         if [ -f /sys/kernel/mm/transparent_hugepage/defrag ]; then
-            echo "never" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null
-            printf "  [OK] %-30s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
+            if [ "$DryRun" = false ]; then
+                echo "never" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null
+                printf "  [OK] %-30s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
+            else
+                printf "  [DRY] %-29s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
+            fi
         fi
 
         # CPU Scaling Governor: Set to 'performance' for all cores
         if [ -d /sys/devices/system/cpu/cpufreq ]; then
-            for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-                [ -f "$gov" ] && echo "performance" > "$gov" 2>/dev/null
-            done
-            printf "  [OK] %-30s -> %-10s (%s)\n" "cpu_governor" "performance" "Power/Perf"
+            if [ "$DryRun" = false ]; then
+                for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+                    [ -f "$gov" ] && echo "performance" > "$gov" 2>/dev/null
+                done
+                printf "  [OK] %-30s -> %-10s (%s)\n" "cpu_governor" "performance" "Power/Perf"
+            else
+                printf "  [DRY] %-29s -> %-10s (%s)\n" "cpu_governor" "performance" "Power/Perf"
+            fi
         fi
 
         if pgrep -x numad >/dev/null 2>&1; then
@@ -487,18 +505,20 @@ run_optimization() {
         [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
         if [ "$current_normalized_mask" != "$TargetNormalizedMask" ]; then
-            taskset -pc "$FinalCpuMask" "$pid" > /dev/null 2>&1
+            if [ "$DryRun" = false ]; then
+                taskset -pc "$FinalCpuMask" "$pid" > /dev/null 2>&1
 
-            if [ "$StrictMem" = true ]; then
-                numactl --membind="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
-            else
-                # Preferred policy: try multiple nodes if available, fallback to single
-                if [[ "$NearbyNodeIds" == *","* ]]; then
-                    if ! numactl --preferred-many="$NearbyNodeIds" -p "$pid" > /dev/null 2>&1; then
-                         numactl --preferred="${NearbyNodeIds%%,*}" -p "$pid" > /dev/null 2>&1
-                    fi
+                if [ "$StrictMem" = true ]; then
+                    numactl --membind="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
                 else
-                    numactl --preferred="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
+                    # Preferred policy: try multiple nodes if available, fallback to single
+                    if [[ "$NearbyNodeIds" == *","* ]]; then
+                        if ! numactl --preferred-many="$NearbyNodeIds" -p "$pid" > /dev/null 2>&1; then
+                             numactl --preferred="${NearbyNodeIds%%,*}" -p "$pid" > /dev/null 2>&1
+                        fi
+                    else
+                        numactl --preferred="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
+                    fi
                 fi
             fi
 
@@ -525,13 +545,21 @@ run_optimization() {
 
             # Migrate pages if there's enough free memory
             if [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
-                if migratepages "$pid" all "${NearbyNodeIds:-$NumaNodeId}" > /dev/null 2>&1; then
-                    status_msg="OPTIMIZED & MOVED"
+                if [ "$DryRun" = false ]; then
+                    if migratepages "$pid" all "${NearbyNodeIds:-$NumaNodeId}" > /dev/null 2>&1; then
+                        status_msg="OPTIMIZED & MOVED"
+                    else
+                        status_msg="OPTIMIZED (MOVE FAILED)"
+                    fi
                 else
-                    status_msg="OPTIMIZED (MOVE FAILED)"
+                    status_msg="WOULD MOVE"
                 fi
             else
                 status_msg="OPTIMIZED (NODE FULL)"
+            fi
+
+            if [ "$DryRun" = true ]; then
+                status_msg="DRY RUN ($status_msg)"
             fi
 
             # Queue for notification
@@ -539,7 +567,9 @@ run_optimization() {
             status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
         else
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
-                status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED" "$full_proc_cmd"
+                local status_msg="OPTIMIZED"
+                [ "$DryRun" = true ] && status_msg="DRY RUN ($status_msg)"
+                status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
             fi
         fi
 
@@ -554,28 +584,30 @@ run_optimization() {
 check_active_optimizations() {
     local now=$(date +%s)
     if [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
-        if [ ${#OptimizedPidsMap[@]} -eq 0 ]; then
-            echo "No processes currently optimized"
-        else
-            echo "PERIODIC STATUS SUMMARY ($(date "+%Y-%m-%d %H:%M:%S")) - $TotalOptimizedCount processes optimized since startup"
+        # Sort PIDs numerically for consistent output
+        local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 
-            # Sort PIDs numerically for consistent output
-            local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
+        for pid in $sorted_pids; do
+            if [ -d "$PROC_PREFIX/proc/$pid" ]; then
+                local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
+                local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+                local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
+                [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
-            for pid in $sorted_pids; do
-                if [ -d "$PROC_PREFIX/proc/$pid" ]; then
-                    local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
-                    local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
-                    local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
-                    [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
+                status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
+            else
+                unset "OptimizedPidsMap[$pid]"
+            fi
+        done
 
-                    status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
-                else
-                    unset "OptimizedPidsMap[$pid]"
-                fi
-            done
-            echo "------------------------------------------------------------------------------------------------"
+        local current_optimized_count=${#OptimizedPidsMap[@]}
+        local summary_msg=""
+        if [ "$current_optimized_count" -eq 0 ]; then
+            summary_msg="No processes currently optimized"
         fi
+
+        status_log "$TotalOptimizedCount procs" "since startup" "---" "OPTIMIZED" "$summary_msg"
+
         LastSummaryTime=$now
     fi
 }
@@ -592,6 +624,7 @@ parse_args() {
             -l|--local-only) IncludeNearby=false; shift ;;
             -a|--all-gpu-procs) OnlyGaming=false; shift ;;
             -x|--no-tune) SkipSystemTune=true; shift ;;
+            -n|--dry-run) DryRun=true; shift ;;
             -k|--no-drop) DropPrivs=false; shift ;;
             -h|--help) usage ;;
             -*) echo "Unknown option: $1" ; usage ;;
@@ -639,6 +672,7 @@ print_banner() {
     echo "CPU TARGETS      : $( [ "$UseHt" = true ] && echo "HT Allowed" || echo "Physical Only" ) ($FinalCpuMask)"
     echo "MEM POLICY       : $mem_policy_label"
     echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
+    echo "DRY RUN MODE     : $( [ "$DryRun" = true ] && echo "ENABLED (No changes will be applied)" || echo "Disabled" )"
     echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
 
     status_log

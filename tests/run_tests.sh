@@ -216,6 +216,60 @@ GpuIndexArg=1
 detect_gpu
 assert_eq "0000:41:00.0" "$PciAddr" "detect_gpu index 1"
 
+# Test 9: Dry-run mode
+DryRun=true
+# Mock commands to check if they were called
+TASKSET_CALLED=false
+NUMACTL_CALLED=false
+MIGRATEPAGES_CALLED=false
+SYSCTL_CALLED=false
+
+taskset() { TASKSET_CALLED=true; }
+numactl() { NUMACTL_CALLED=true; }
+migratepages() { MIGRATEPAGES_CALLED=true; }
+sysctl() { SYSCTL_CALLED=true; }
+
+# Mocking for system_tune
+EUID=0
+SkipSystemTune=false
+system_tune
+
+assert_eq "false" "$SYSCTL_CALLED" "Dry-run: sysctl not called"
+
+# Mocking for run_optimization
+PROC_PREFIX="$(pwd)/tests/mock_proc"
+mkdir -p "$PROC_PREFIX/proc/9999"
+touch "$PROC_PREFIX/proc/9999/environ"
+echo -e "STEAM_GAME_ID=123\0" > "$PROC_PREFIX/proc/9999/environ"
+
+# Mocking fuser to return our test PID
+fuser() { echo "9999"; }
+# Mocking ps for PID 9999
+ps() {
+    case "$*" in
+        *"-p 9999 -o comm="*) echo "game_exe" ;;
+        *"-fp 9999 -o args="*) echo "./game_exe" ;;
+        *"-p 9999 -o ppid="*) echo "1" ;;
+        *) command ps "$@" ;;
+    esac
+}
+# Mock taskset -pc 9999 to return some affinity
+taskset() {
+    if [[ "$*" == "-pc 9999" ]]; then
+        echo "pid 9999's current affinity list: 0-7"
+    else
+        TASKSET_CALLED=true
+    fi
+}
+
+TargetNormalizedMask="0,1,2,3" # Different from 0-7
+
+run_optimization
+
+assert_eq "false" "$TASKSET_CALLED" "Dry-run: taskset not called"
+assert_eq "false" "$NUMACTL_CALLED" "Dry-run: numactl not called"
+assert_eq "false" "$MIGRATEPAGES_CALLED" "Dry-run: migratepages not called"
+
 echo -e "\nSummary: ${GREEN}$PASSED passed${NC}, ${RED}$FAILED failed${NC}"
 if [ $FAILED -gt 0 ]; then
     exit 1

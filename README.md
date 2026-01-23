@@ -70,6 +70,7 @@ The optimizer is designed to work out-of-the-box, but you can customize its beha
 - `-l, --local-only`: Disable "nearby node" logic and stick strictly to the GPU's primary node.
 - `-a, --all-gpu-procs`: Optimize *every* process using the GPU, not just games.
 - `-x, --no-tune`: Skip system-level kernel tuning (sysctl, etc.).
+- `-n, --dry-run`: Dry-run mode. Don't apply any changes, just show what would be done.
 - `-k, --no-drop`: Do not drop root privileges (useful for certain troubleshooting).
 - `-h, --help`: Show full usage information.
 
