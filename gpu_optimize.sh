@@ -40,7 +40,7 @@ MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time o
 # State Tracking
 declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
 TotalOptimizedCount=0        # Total number of unique processes optimized since script start
-LastOptimizedCount=0         # Number of optimized processes in the last check
+LastOptimizedCount=-1        # Number of optimized processes in the last check
 AllTimeFile=""               # Path to the all-time tracking file
 LifetimeOptimizedCount=0     # Total number of unique processes optimized across all runs
 LastSummaryTime=$(date +%s)  # Timestamp of the last periodic summary report
