@@ -42,7 +42,7 @@ declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first
 TotalOptimizedCount=0        # Total number of unique processes optimized since script start
 LastOptimizedCount=0         # Number of optimized processes in the last check
 AllTimeFile=""               # Path to the all-time tracking file
-AllTimeOptimizedCount=0      # Total number of unique processes optimized across all runs
+LifetimeOptimizedCount=0     # Total number of unique processes optimized across all runs
 LastSummaryTime=$(date +%s)  # Timestamp of the last periodic summary report
 LastOptimizationTime=$(date +%s) # Timestamp of the last successful optimization
 SummarySilenced=false        # True if we have silenced periodic summaries due to inactivity
@@ -251,7 +251,7 @@ discover_resources() {
         NearbyNodeIds=$(get_nearby_nodes "$NumaNodeId")
     fi
 
-    if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "$NumaNodeId" ]; then
+    if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "$NumaNodeId" ] && [ "$NearbyNodeIds" != "-1" ]; then
         RawCpuList=$(get_nodes_cpulist "$NearbyNodeIds")
     fi
 
@@ -404,13 +404,13 @@ is_gaming_process() {
     local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
     case "$proc_comm" in
         Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) return 1 ;;
-        chrome|firefox|brave|msedge|opera|browser) return 1 ;;
-        steamwebhelper|Discord|slack|teams|obs|obs64|heroic) return 1 ;;
+        chrome|firefox|brave|msedge|opera|browser|chromium) return 1 ;;
+        steamwebhelper|Discord|slack|teams|obs|obs64|heroic|lutris) return 1 ;;
     esac
 
     # 2. UI/Utility Heuristics
     local proc_args=$(ps -fp "$pid" -o args= 2>/dev/null)
-    if echo "$proc_args" | grep -qE -- "--type=(zygote|renderer|gpu-process|utility)"; then
+    if echo "$proc_args" | grep -qiE -- "--type=(zygote|renderer|gpu-process|utility|extension-process|worker-process)"; then
         return 1
     fi
 
@@ -422,7 +422,7 @@ is_gaming_process() {
     fi
 
     # 4. Binary Name Heuristics
-    if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer"; then
+    if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer|UnrealEditor"; then
         return 0
     fi
 
@@ -581,24 +581,32 @@ run_optimization() {
             local simplified_cmd=""
             if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
                 simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
-            else
+            elif [ "$full_proc_cmd" != "[Hidden or Exited]" ]; then
                 simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
             fi
+            # Ensure simplified_cmd is not empty
+            [ -z "$simplified_cmd" ] && simplified_cmd="$proc_comm"
+            [ -z "$simplified_cmd" ] && simplified_cmd="Process $pid"
 
             local free_kb=0
-            if [ -n "$NearbyNodeIds" ]; then
-                IFS=',' read -ra nodes <<< "$NearbyNodeIds"
-                for node in "${nodes[@]}"; do
-                    free_kb=$((free_kb + $(get_node_free_kb "$node")))
-                done
-            else
-                free_kb=$(get_node_free_kb "$NumaNodeId")
-            fi
+    if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "-1" ]; then
+        IFS=',' read -ra nodes <<< "$NearbyNodeIds"
+        for node in "${nodes[@]}"; do
+            free_kb=$((free_kb + $(get_node_free_kb "$node")))
+        done
+    elif [ "$NumaNodeId" -ge 0 ]; then
+        free_kb=$(get_node_free_kb "$NumaNodeId")
+    else
+        # No specific NUMA node, but let's assume we can move if we want? 
+        # Actually migratepages needs target nodes. If we have no nodes, we can't move.
+        free_kb=0
+    fi
 
             # Migrate pages if there's enough free memory
-            if [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
+            local target_nodes="${NearbyNodeIds:-$NumaNodeId}"
+            if [[ "$target_nodes" != "-1" ]] && [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
                 if [ "$DryRun" = false ]; then
-                    if migratepages "$pid" all "${NearbyNodeIds:-$NumaNodeId}" > /dev/null 2>&1; then
+                    if migratepages "$pid" all "$target_nodes" > /dev/null 2>&1; then
                         status_msg="OPTIMIZED & MOVED"
                     else
                         status_msg="OPTIMIZED (MOVE FAILED)"
@@ -606,6 +614,8 @@ run_optimization() {
                 else
                     status_msg="WOULD MOVE"
                 fi
+            elif [[ "$target_nodes" == "-1" ]]; then
+                status_msg="OPTIMIZED"
             else
                 status_msg="OPTIMIZED (NODE FULL)"
             fi
@@ -615,18 +625,18 @@ run_optimization() {
             fi
 
             # Queue for notification
-            PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|${NearbyNodeIds:-$NumaNodeId}|$process_rss_kb")
+            PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|$target_nodes|$process_rss_kb")
             status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
 
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 ((TotalOptimizedCount++))
-                ((AllTimeOptimizedCount++))
+                ((LifetimeOptimizedCount++))
                 LastOptimizationTime=$(date +%s)
                 SummarySilenced=false
                 if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
                     # Log entry format: TIMESTAMP | PID | COMM | STATUS | NODES | COMMAND
                     printf "%-19s | %-8s | %-16s | %-22s | %-8s | %s\n" \
-                        "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$status_msg" "${NearbyNodeIds:-$NumaNodeId}" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
+                        "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$status_msg" "$target_nodes" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
                     trim_all_time_log
                 fi
             fi
@@ -658,6 +668,7 @@ summarize_optimizations() {
 
     local current_optimized_count=${#OptimizedPidsMap[@]}
     local summary_msg=""
+    local summary_status="OPTIMIZED"
 
     # Trigger summary if forced, interval passed, or if we just dropped to zero optimized processes
     local should_summarize=false
@@ -670,6 +681,7 @@ summarize_optimizations() {
         # Just dropped to zero, trigger immediate summary
         should_summarize=true
         summary_msg="No optimized processes remaining"
+        summary_status="IDLE"
     fi
 
     LastOptimizedCount=$current_optimized_count
@@ -688,7 +700,7 @@ summarize_optimizations() {
         fi
 
         echo "------------------------------------------------------------------------------------------------"
-        status_log "$TotalOptimizedCount procs" "since startup" "$AllTimeOptimizedCount all time" "OPTIMIZED" "$summary_msg"
+        status_log "$TotalOptimizedCount procs" "since startup" "$LifetimeOptimizedCount all time" "$summary_status" "$summary_msg"
 
         # Sort PIDs numerically for consistent output
         local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
@@ -719,9 +731,9 @@ load_all_time_stats() {
     if [ -n "$target_home" ]; then
         AllTimeFile="${target_home}/.gpu_numa_optimizations"
         if [ -f "$AllTimeFile" ]; then
-            AllTimeOptimizedCount=$(wc -l < "$AllTimeFile" 2>/dev/null || echo 0)
+            LifetimeOptimizedCount=$(wc -l < "$AllTimeFile" 2>/dev/null || echo 0)
             # Ensure it's a number
-            [[ "$AllTimeOptimizedCount" =~ ^[0-9]+$ ]] || AllTimeOptimizedCount=0
+            [[ "$LifetimeOptimizedCount" =~ ^[0-9]+$ ]] || LifetimeOptimizedCount=0
         fi
     fi
 }
@@ -731,13 +743,12 @@ load_all_time_stats() {
 trim_all_time_log() {
     [ -z "$AllTimeFile" ] || [ ! -f "$AllTimeFile" ] && return
     
-    local current_lines=$AllTimeOptimizedCount
+    local current_lines=$(wc -l < "$AllTimeFile" 2>/dev/null || echo 0)
     # Only trim if we exceed the limit by more than 50 lines to reduce IO
     if [ "$current_lines" -gt $((MaxAllTimeLogLines + 50)) ]; then
         local temp_file="${AllTimeFile}.tmp"
         if tail -n "$MaxAllTimeLogLines" "$AllTimeFile" > "$temp_file" 2>/dev/null; then
             mv "$temp_file" "$AllTimeFile"
-            AllTimeOptimizedCount=$MaxAllTimeLogLines
         else
             rm -f "$temp_file"
         fi
@@ -788,7 +799,7 @@ print_banner() {
     echo "GPU MODEL        :$(lspci -s "$PciAddr" | cut -d: -f3) ($PciAddr)"
 
     if [ "$NumaNodeId" -ge 0 ]; then
-        if [ -n "$NearbyNodeIds" ]; then
+        if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "-1" ]; then
             echo "NUMA NODES       : $NearbyNodeIds (Nearby Max Distance $MaxDist)"
             IFS=',' read -ra nodes <<< "$NearbyNodeIds"
             for node in "${nodes[@]}"; do

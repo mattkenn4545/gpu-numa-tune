@@ -21,6 +21,10 @@ FAILED=0
 export PATH="$PATH:$(pwd)/tests/mock_bin"
 mkdir -p tests/mock_bin
 
+# Pre-define variables used in the script to avoid issues during sourcing if they are used at top-level
+AllTimeOptimizedCount=0
+LifetimeOptimizedCount=0
+
 # Create mocks for external commands
 lspci() {
     echo "0000:01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
@@ -300,7 +304,7 @@ assert_eq "false" "$MIGRATEPAGES_CALLED" "Dry-run: migratepages not called"
 echo "Test 10: All-time tracking"
 AllTimeFile="tests/mock_all_time"
 rm -f "$AllTimeFile"
-AllTimeOptimizedCount=0
+LifetimeOptimizedCount=0
 TotalOptimizedCount=0
 OptimizedPidsMap=()
 
@@ -317,7 +321,7 @@ echo "entry2" >> tests/mock_home/.gpu_numa_optimizations
 TargetUser="testuser"
 
 load_all_time_stats
-assert_eq "2" "$AllTimeOptimizedCount" "load_all_time_stats loads correct line count"
+assert_eq "2" "$LifetimeOptimizedCount" "load_all_time_stats loads correct line count"
 assert_eq "$(pwd)/tests/mock_home/.gpu_numa_optimizations" "$AllTimeFile" "AllTimeFile path set correctly"
 
 # Simulate optimizing a process (ACTUAL optimization)
@@ -335,7 +339,7 @@ rm -f "$AllTimeFile"
 touch "$AllTimeFile"
 echo "entry1" >> "$AllTimeFile"
 echo "entry2" >> "$AllTimeFile"
-AllTimeOptimizedCount=2
+LifetimeOptimizedCount=2
 
 # Mock ps for this PID
 ps() {
@@ -351,7 +355,7 @@ ps() {
 if [ "$current_normalized_mask" != "$TargetNormalizedMask" ]; then
     if [ -z "${OptimizedPidsMap[$pid]}" ]; then
         ((TotalOptimizedCount++))
-        ((AllTimeOptimizedCount++))
+        ((LifetimeOptimizedCount++))
         if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
             printf "%-19s | %-8s | %-16s | %-22s | %-8s | %s\n" \
                 "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$status_msg" "${NearbyNodeIds:-$NumaNodeId}" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
@@ -361,7 +365,7 @@ if [ "$current_normalized_mask" != "$TargetNormalizedMask" ]; then
 fi
 
 assert_eq "1" "$TotalOptimizedCount" "TotalOptimizedCount incremented for actual optimization"
-assert_eq "3" "$AllTimeOptimizedCount" "AllTimeOptimizedCount incremented from 2"
+assert_eq "3" "$LifetimeOptimizedCount" "LifetimeOptimizedCount incremented from 2"
 assert_eq "3" "$(wc -l < $AllTimeFile)" "AllTimeFile line count updated for actual optimization"
 
 # Simulate process ALREADY optimized (mask matches)
@@ -381,7 +385,7 @@ else
 fi
 
 assert_eq "1" "$TotalOptimizedCount" "TotalOptimizedCount NOT incremented if already optimized"
-assert_eq "3" "$AllTimeOptimizedCount" "AllTimeOptimizedCount NOT incremented if already optimized"
+assert_eq "3" "$LifetimeOptimizedCount" "LifetimeOptimizedCount NOT incremented if already optimized"
 assert_eq "3" "$(wc -l < $AllTimeFile)" "AllTimeFile NOT updated if already optimized"
 
 # Cleanup mock home
@@ -399,7 +403,7 @@ output=$(
     TargetNormalizedMask="0,1,2,3,4,5,6,7"
     OptimizedPidsMap=()
     TotalOptimizedCount=0
-    AllTimeOptimizedCount=5 # Pre-set some value
+    LifetimeOptimizedCount=5 # Pre-set some value
     LastSummaryTime=$(date +%s)
     
     # We want to check if print_banner followed by summarize_optimizations true works
@@ -418,21 +422,18 @@ MaxAllTimeLogLines=10
 
 # Populate with 11 lines (exceeds MaxAllTimeLogLines but NOT by 50)
 for i in {1..11}; do echo "line$i" >> "$AllTimeFile"; done
-AllTimeOptimizedCount=11
+# LifetimeOptimizedCount is not used by trim_all_time_log anymore, it recalculates
 
 trim_all_time_log
 assert_eq "11" "$(wc -l < "$AllTimeFile")" "trim_all_time_log does NOT trim within 50-line buffer"
-assert_eq "11" "$AllTimeOptimizedCount" "AllTimeOptimizedCount remains 11"
 
 # Populate to 61 lines (exceeds MaxAllTimeLogLines + 50)
 for i in {12..61}; do echo "line$i" >> "$AllTimeFile"; done
-AllTimeOptimizedCount=61
 
 trim_all_time_log
 assert_eq "10" "$(wc -l < "$AllTimeFile")" "trim_all_time_log trims to MaxAllTimeLogLines after 50-line overflow"
 assert_eq "line52" "$(head -n 1 "$AllTimeFile")" "trim_all_time_log keeps most recent entries (line52)"
 assert_eq "line61" "$(tail -n 1 "$AllTimeFile")" "trim_all_time_log keeps most recent entries (line61)"
-assert_eq "10" "$AllTimeOptimizedCount" "AllTimeOptimizedCount updated to MaxAllTimeLogLines"
 
 if [ $FAILED -gt 0 ]; then
     exit 1
