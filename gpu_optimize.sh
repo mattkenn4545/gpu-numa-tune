@@ -40,6 +40,7 @@ MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time o
 # State Tracking
 declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
 TotalOptimizedCount=0        # Total number of unique processes optimized since script start
+LastOptimizedCount=0         # Number of optimized processes in the last check
 AllTimeFile=""               # Path to the all-time tracking file
 AllTimeOptimizedCount=0      # Total number of unique processes optimized across all runs
 LastSummaryTime=$(date +%s)  # Timestamp of the last periodic summary report
@@ -644,14 +645,40 @@ run_optimization() {
 }
 
 # Periodically prints a summary of optimized processes
-check_active_optimizations() {
+summarize_optimizations() {
     local force_summary=${1:-false}
     local now=$(date +%s)
+
+    # First, cleanup dead processes to get an accurate count
+    for pid in "${!OptimizedPidsMap[@]}"; do
+        if [ ! -d "$PROC_PREFIX/proc/$pid" ]; then
+            unset "OptimizedPidsMap[$pid]"
+        fi
+    done
+
+    local current_optimized_count=${#OptimizedPidsMap[@]}
+    local summary_msg=""
+
+    # Trigger summary if forced, interval passed, or if we just dropped to zero optimized processes
+    local should_summarize=false
     if [ "$force_summary" = true ] || [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
+        should_summarize=true
+        if [ "$current_optimized_count" -eq 0 ]; then
+            summary_msg="No processes currently optimized"
+        fi
+    elif [ "$LastOptimizedCount" -gt 0 ] && [ "$current_optimized_count" -eq 0 ]; then
+        # Just dropped to zero, trigger immediate summary
+        should_summarize=true
+        summary_msg="No optimized processes remaining"
+    fi
+
+    LastOptimizedCount=$current_optimized_count
+
+    if [ "$should_summarize" = true ]; then
         if [ "$force_summary" = false ] && [ $((now - LastOptimizationTime)) -ge "$SummarySilenceTimeout" ]; then
             if [ "$SummarySilenced" = false ]; then
                 echo "------------------------------------------------------------------------------------------------"
-                echo "No processes optimized in $(($SummarySilenceTimeout / 3600)) hours. Silencing periodic summaries."
+                echo "No processes optimized in $((SummarySilenceTimeout / 3600)) hours. Silencing periodic summaries."
                 echo "Monitoring continues; summaries will resume if a qualifying process is detected."
                 echo "------------------------------------------------------------------------------------------------"
                 SummarySilenced=true
@@ -660,29 +687,20 @@ check_active_optimizations() {
             return
         fi
 
+        echo "------------------------------------------------------------------------------------------------"
+        status_log "$TotalOptimizedCount procs" "since startup" "$AllTimeOptimizedCount all time" "OPTIMIZED" "$summary_msg"
+
         # Sort PIDs numerically for consistent output
         local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 
         for pid in $sorted_pids; do
-            if [ -d "$PROC_PREFIX/proc/$pid" ]; then
-                local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
-                local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
-                local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
-                [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
+            local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
+            local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+            local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
+            [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
-                status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
-            else
-                unset "OptimizedPidsMap[$pid]"
-            fi
+            status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
         done
-
-        local current_optimized_count=${#OptimizedPidsMap[@]}
-        local summary_msg=""
-        if [ "$current_optimized_count" -eq 0 ]; then
-            summary_msg="No processes currently optimized"
-        fi
-
-        status_log "$TotalOptimizedCount procs" "since startup" "$AllTimeOptimizedCount all time" "OPTIMIZED" "$summary_msg"
 
         LastSummaryTime=$now
     fi
@@ -803,7 +821,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     detect_target_user
 
     # Drop privileges if a target user was detected, we are root, and dropping is enabled.
-    # This allows the script to perform system tuning as root, then switch to the user 
+    # This allows the script to perform system tuning as root, then switch to the user
     # context for monitoring and optimizing user-owned processes.
     if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
         echo "--> Dropping privileges to $TargetUser..."
@@ -819,7 +837,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     load_all_time_stats
 
     print_banner
-    check_active_optimizations true
+    summarize_optimizations true
     if [ "$DaemonMode" = true ]; then
         # Continuous monitoring loop
         while true; do
@@ -830,13 +848,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             # (e.g., a game launcher starting the game engine) to appear.
             if [ ${#PendingOptimizations[@]} -gt 0 ]; then
                 log "Optimized ${#PendingOptimizations[@]} process(es). Waiting ${SleepInterval} to aggregate more..."
-                sleep $((SleepInterval))
+                sleep "$SleepInterval"
                 # Run one more time to catch immediate followers
                 run_optimization
                 flush_notifications
             fi
 
-            check_active_optimizations
+            summarize_optimizations
             sleep "$SleepInterval"
         done
     else

@@ -402,10 +402,10 @@ output=$(
     AllTimeOptimizedCount=5 # Pre-set some value
     LastSummaryTime=$(date +%s)
     
-    # We want to check if print_banner followed by check_active_optimizations true works
+    # We want to check if print_banner followed by summarize_optimizations true works
     # We can just call the functions if we source the script
     print_banner > /dev/null # Skip banner
-    check_active_optimizations true
+    summarize_optimizations true
 )
 
 assert_eq "0 procs    | since startup   | 5 all time         | OPTIMIZED                 | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
