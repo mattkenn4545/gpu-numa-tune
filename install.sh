@@ -1,6 +1,20 @@
 #!/bin/bash
 
-# Simple installer/updater for gpu-numa-tune
+# ==============================================================================
+# GPU NUMA Optimizer - Installer/Updater
+# ==============================================================================
+# Purpose:
+#   Automates the installation or update of the GPU NUMA Optimizer script
+#   and its associated systemd service.
+#
+# Actions:
+#   1. Copies the script to /usr/local/bin.
+#   2. Installs the systemd service file to /etc/systemd/system.
+#   3. Reloads systemd and enables/restarts the service.
+#
+# Usage:
+#   sudo ./install.sh
+# ==============================================================================
 
 set -e
 

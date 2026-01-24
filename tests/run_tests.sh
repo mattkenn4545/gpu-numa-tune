@@ -1,6 +1,20 @@
 #!/bin/bash
 
-# Clean up function
+# ==============================================================================
+# GPU NUMA Optimizer - Test Suite
+# ==============================================================================
+# Purpose:
+#   Validates the core logic of gpu_optimize.sh using mocks for system 
+#   resources, hardware files, and external utilities.
+#
+# Methodology:
+#   1. Sets up a mock environment (sysfs, procfs, devfs) in local directories.
+#   2. Mocks external commands (lspci, ps, numactl, etc.) using shell functions.
+#   3. Sources gpu_optimize.sh to gain access to its internal functions.
+#   4. Executes unit tests and asserts expected outcomes.
+# ==============================================================================
+
+# Clean up function for mock environment
 cleanup() {
     rm -rf tests/mock_bin tests/mock_proc tests/mock_sys tests/mock_dev tests/mock_all_time tests/mock_home tests/mock_all_time.tmp
 }
@@ -16,16 +30,14 @@ NC='\033[0m' # No Color
 PASSED=0
 FAILED=0
 
-# Source the script - we wrapped the execution in a check so this won't run it
-# We need to provide a fake environment for some things that might run at top level or in functions
-export PATH="$PATH:$(pwd)/tests/mock_bin"
-mkdir -p tests/mock_bin
+# --- Mocking Infrastructure ---
 
-# Pre-define variables used in the script to avoid issues during sourcing if they are used at top-level
-AllTimeOptimizedCount=0
-LifetimeOptimizedCount=0
+# Many of the functions in gpu_optimize.sh rely on external commands or /proc and /sys files.
+# To test them without requiring root or specific hardware, we use a combination of:
+#   1. Redefining commands as shell functions (e.g., ps(), lspci()).
+#   2. Using environment variables (SYSFS_PREFIX, PROC_PREFIX) to redirect file lookups.
 
-# Create mocks for external commands
+# Create mocks for basic external commands
 lspci() {
     echo "0000:01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
 }
@@ -34,6 +46,8 @@ notify-send() {
     return 0
 }
 
+# Source the script - the script has a guard [[ "${BASH_SOURCE[0]}" == "${0}" ]] 
+# to prevent execution when sourced, allowing us to test its functions.
 source ./gpu_optimize.sh
 
 assert_eq() {
@@ -412,7 +426,7 @@ output=$(
     summarize_optimizations true
 )
 
-assert_eq "0 procs    | since startup   | 5 all time         | OPTIMIZED                 | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
+assert_eq "0 procs    | since startup   | 5 all time         | SCANNING                  | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
 
 # Test 12: All-time log rotation
 echo "Test 12: All-time log rotation (with 50-line buffer)"

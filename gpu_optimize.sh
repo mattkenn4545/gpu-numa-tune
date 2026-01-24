@@ -191,12 +191,13 @@ flush_notifications() {
 
 # Identifies the GPU's PCI address based on the provided index.
 detect_gpu() {
-    # Preferred: GPUs with active render nodes
+    # Preferred: GPUs with active render nodes (DRM/DRI)
+    # This identifies modern GPUs by checking /dev/dri/renderD* devices.
     mapfile -t active_gpus < <(
         for d in "$DEV_PREFIX"/dev/dri/renderD*; do
             [ -e "$d" ] || continue
             # Get PCI address from sysfs for this render node
-            # /dev/dri/renderD128 -> /sys/class/drm/renderD128/device
+            # Example: /dev/dri/renderD128 -> /sys/class/drm/renderD128/device
             pci_path=$(readlink -f "$SYSFS_PREFIX/sys/class/drm/$(basename "$d")/device" 2>/dev/null)
             if [[ "$pci_path" =~ ([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F])$ ]]; then
                 echo "${BASH_REMATCH[1]}"
@@ -204,16 +205,17 @@ detect_gpu() {
         done | sort -u
     )
 
-    # Fallback/Additional: Known GPU vendors if no render nodes or to complement
+    # Fallback/Additional: Known GPU vendors if no render nodes are active or detected.
+    # We look for NVIDIA, AMD, and Intel VGA or 3D controllers.
     mapfile -t vendor_gpus < <(lspci -D | grep -iE "NVIDIA|Advanced Micro Devices|Intel Corporation" | grep -iE "VGA|3D" | awk '{print $1}')
     
-    # Merge and deduplicate
+    # Merge both detection methods and deduplicate results.
     mapfile -t all_gpu_pci < <(printf "%s\n" "${active_gpus[@]}" "${vendor_gpus[@]}" | grep -v "^$" | sort -u)
 
     GpuIndexArg=${GpuIndexArg:-0}
 
     if [ "${#all_gpu_pci[@]}" -eq 0 ]; then
-        # Last resort: any VGA/3D device
+        # Last resort: Any device reported by lspci as VGA or 3D.
         mapfile -t all_gpu_pci < <(lspci -D | grep -iE 'vga|3d' | awk '{print $1}')
     fi
 
@@ -364,22 +366,35 @@ normalize_affinity() {
 filter_cpus() {
     FinalCpuMask=""
     if [ "$UseHt" = true ]; then
+        # If Hyper-Threading is allowed, use the full list of CPUs provided by the hardware
         FinalCpuMask="$RawCpuList"
     else
+        # If physical-only mode is requested, we must filter out the HT/SMT siblings.
+        # We iterate through the raw CPU list, which may contain ranges (e.g., 0-7,12).
         IFS=',' read -ra cpu_ranges <<< "$RawCpuList"
         for range in "${cpu_ranges[@]}"; do
             [ -z "$range" ] && continue
+            
+            # Expand ranges like '0-3' into '0 1 2 3'
             # shellcheck disable=SC2086
             [[ $range == *-* ]] && expanded_list=$(seq ${range%-*} ${range#*-}) || expanded_list=$range
+            
             for cpu_id in $expanded_list; do
+                # On Linux, thread siblings are listed in sysfs.
+                # Usually, the first sibling in the list is the physical core.
                 sibling_file="$SYSFS_PREFIX/sys/devices/system/cpu/cpu$cpu_id/topology/thread_siblings_list"
                 if [ -f "$sibling_file" ]; then
+                    # The file contains a comma or dash separated list of sibling IDs.
+                    # We extract the first numeric ID to identify the "primary" core.
                     # shellcheck disable=SC2002
                     first_sibling=$(cat "$sibling_file" | cut -d',' -f1 | cut -d'-' -f1)
+                    
+                    # If the current CPU ID matches the first sibling, it's a primary/physical core.
                     [[ "$cpu_id" -eq "$first_sibling" ]] && FinalCpuMask+="$cpu_id,"
                 fi
             done
         done
+        # Remove trailing comma
         FinalCpuMask=${FinalCpuMask%,}
     fi
 
@@ -588,21 +603,25 @@ run_optimization() {
             [ -z "$simplified_cmd" ] && simplified_cmd="$proc_comm"
             [ -z "$simplified_cmd" ] && simplified_cmd="Process $pid"
 
+            # Determine memory availability on target nodes to decide if migration is safe.
+            # Page migration (moving memory already allocated) requires enough free space
+            # on the destination NUMA node to avoid triggering OOM or excessive swapping.
             local free_kb=0
-    if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "-1" ]; then
-        IFS=',' read -ra nodes <<< "$NearbyNodeIds"
-        for node in "${nodes[@]}"; do
-            free_kb=$((free_kb + $(get_node_free_kb "$node")))
-        done
-    elif [ "$NumaNodeId" -ge 0 ]; then
-        free_kb=$(get_node_free_kb "$NumaNodeId")
-    else
-        # No specific NUMA node, but let's assume we can move if we want? 
-        # Actually migratepages needs target nodes. If we have no nodes, we can't move.
-        free_kb=0
-    fi
+            if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "-1" ]; then
+                IFS=',' read -ra nodes <<< "$NearbyNodeIds"
+                for node in "${nodes[@]}"; do
+                    free_kb=$((free_kb + $(get_node_free_kb "$node")))
+                done
+            elif [ "$NumaNodeId" -ge 0 ]; then
+                free_kb=$(get_node_free_kb "$NumaNodeId")
+            else
+                # No specific NUMA node detected; migration is not possible.
+                free_kb=0
+            fi
 
-            # Migrate pages if there's enough free memory
+            # Migrate pages if there's enough free memory (with a safety margin).
+            # We use 'migratepages' to move all existing memory pages of the process
+            # to the target NUMA nodes identified earlier.
             local target_nodes="${NearbyNodeIds:-$NumaNodeId}"
             if [[ "$target_nodes" != "-1" ]] && [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
                 if [ "$DryRun" = false ]; then
@@ -615,8 +634,10 @@ run_optimization() {
                     status_msg="WOULD MOVE"
                 fi
             elif [[ "$target_nodes" == "-1" ]]; then
+                # Optimized affinity but no target NUMA node for memory
                 status_msg="OPTIMIZED"
             else
+                # Not enough free memory on the target nodes to safely migrate pages
                 status_msg="OPTIMIZED (NODE FULL)"
             fi
 
