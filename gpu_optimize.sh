@@ -668,7 +668,7 @@ summarize_optimizations() {
 
     local current_optimized_count=${#OptimizedPidsMap[@]}
     local summary_msg=""
-    local summary_status="OPTIMIZED"
+    local summary_status="SCANNING"
 
     # Trigger summary if forced, interval passed, or if we just dropped to zero optimized processes
     local should_summarize=false
