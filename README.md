@@ -18,6 +18,7 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes. Summaries are automatically silenced after 2 hours of inactivity to keep your logs clean, and will resume once a qualifying process is detected.
 - **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
 - **🧬 Nearby Node Support:** If the local node is full, it intelligently expands to the next closest nodes based on hardware distance.
+- **⚙️ Per-Process Configuration:** Fine-tune settings like HT usage or memory locality for specific games using dedicated `.conf` files (e.g., `Cyberpunk2077.exe.conf`).
 - **📈 All-Time Tracking:** Maintains a persistent log of every optimization across reboots, providing historical insights into your system's performance tuning.
 - **📊 Real-time Monitoring:** Periodically summarizes active optimizations and cleans up dead processes from tracking, with automatic silencing during periods of inactivity.
 
@@ -64,6 +65,16 @@ The optimizer can be configured via persistent configuration files. Settings are
 1.  `/etc/gpu-numa-tune.conf` (System-wide)
 2.  `~/.config/gpu-numa-tune.conf` (User-specific)
 3.  `./gpu-numa-tune.conf` (Local directory)
+
+#### Per-Process Configuration:
+You can also create process-specific configuration files. The optimizer looks for files named `<executable_name>.conf` (e.g., `Cyberpunk2077.exe.conf`) in:
+
+1.  `/etc/gpu-numa-tune/`
+2.  `~/.config/gpu-numa-tune/`
+3.  The same directory as the game's executable.
+4.  The current working directory of the script.
+
+These per-process configs can override settings like `UseHt`, `IncludeNearby`, `MaxDist`, and `StrictMem` for that specific game without affecting global behavior.
 
 **Note:** Command-line options always take precedence over configuration file values.
 

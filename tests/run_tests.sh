@@ -185,14 +185,14 @@ numactl() {
 }
 
 MaxDist=11
-assert_eq "0,1" "$(get_nearby_nodes 0)" "get_nearby_nodes with numactl"
+assert_eq "0,1" "$(get_nearby_nodes 0 11)" "get_nearby_nodes with numactl"
 assert_eq "0-3,4-7" "$(get_nodes_cpulist "0,1")" "get_nodes_cpulist"
 
 # Test without numactl
 numactl() {
     return 127
 }
-assert_eq "0" "$(get_nearby_nodes 0)" "get_nearby_nodes without numactl"
+assert_eq "0" "$(get_nearby_nodes 0 11)" "get_nearby_nodes without numactl"
 
 # Test 6: Memory utils
 echo "Node 0 MemTotal: 16486400 kB" > "$SYSFS_PREFIX/sys/devices/system/node/node0/meminfo"
@@ -321,6 +321,7 @@ rm -f "$AllTimeFile"
 LifetimeOptimizedCount=0
 TotalOptimizedCount=0
 OptimizedPidsMap=()
+simplified_cmd="game" # Added for Test 10 logging
 
 # Simulate load_all_time_stats by manually setting up and calling it
 # We need to mock getent
@@ -371,8 +372,8 @@ if [ "$current_normalized_mask" != "$TargetNormalizedMask" ]; then
         ((TotalOptimizedCount++))
         ((LifetimeOptimizedCount++))
         if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
-            printf "%-19s | %-8s | %-16s | %-22s | %-8s | %s\n" \
-                "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$status_msg" "${NearbyNodeIds:-$NumaNodeId}" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
+            printf "%-19s | %-8s | %-16s | %-20s | %-22s | %-8s | %s\n" \
+                "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$simplified_cmd" "$status_msg" "${NearbyNodeIds:-$NumaNodeId}" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
         fi
     fi
     OptimizedPidsMap[$pid]=$(date +%s)
@@ -428,7 +429,7 @@ output=$(
     summarize_optimizations true
 )
 
-assert_eq "0 procs    | since startup   | 5 all time         | SCANNING                  | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
+assert_eq "0 procs    | since startup    |                      | 5 all time         | SCANNING                  | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
 
 # Test 11b: Startup summary -l option
 echo "Test 11b: Startup summary -l option"

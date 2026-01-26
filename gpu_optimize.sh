@@ -47,37 +47,68 @@ load_config() {
     )
 
     for file in "${config_files[@]}"; do
+        [ -f "$file" ] && parse_config_file "$file"
+    done
+}
+
+# Helper to parse a single configuration file
+parse_config_file() {
+    local file="$1"
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+        # Ignore comments and empty lines
+        [[ "$key" =~ ^[[:space:]]*#.*$ ]] && continue
+        [[ -z "$key" ]] && continue
+        
+        # Remove leading/trailing whitespace from key and value
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        # Remove trailing comments from value if any
+        value=${value%%#*}
+        value=$(echo "$value" | xargs)
+        
+        case "$key" in
+            UseHt) UseHt="$value" ;;
+            DaemonMode) DaemonMode="$value" ;;
+            SleepInterval) SleepInterval="$value" ;;
+            StrictMem) StrictMem="$value" ;;
+            IncludeNearby) IncludeNearby="$value" ;;
+            MaxDist) MaxDist="$value" ;;
+            OnlyGaming) OnlyGaming="$value" ;;
+            SkipSystemTune) SkipSystemTune="$value" ;;
+            DryRun) DryRun="$value" ;;
+            DropPrivs) DropPrivs="$value" ;;
+            MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
+            GpuIndex) GpuIndexArg="$value" ;;
+            SummaryInterval) SummaryInterval="$value" ;;
+            SummarySilenceTimeout) SummarySilenceTimeout="$value" ;;
+            HeaderInterval) HeaderInterval="$value" ;;
+        esac
+    done < "$file"
+}
+
+# Load per-process configuration based on simplified_cmd
+load_process_config() {
+    local simplified_cmd="$1"
+    local config_name="${simplified_cmd}.conf"
+    
+    local config_files=()
+    
+    # 1. Global per-process config
+    config_files+=("/etc/gpu-numa-tune/${config_name}")
+    
+    # 2. User per-process config
+    if [ -n "$TargetUser" ]; then
+        local target_home=$(getent passwd "$TargetUser" | cut -d: -f6)
+        [ -n "$target_home" ] && config_files+=("${target_home}/.config/gpu-numa-tune/${config_name}")
+    fi
+    config_files+=("$HOME/.config/gpu-numa-tune/${config_name}")
+
+    # 3. Current directory
+    config_files+=("$(pwd)/${config_name}")
+
+    for file in "${config_files[@]}"; do
         if [ -f "$file" ]; then
-            while IFS='=' read -r key value || [ -n "$key" ]; do
-                # Ignore comments and empty lines
-                [[ "$key" =~ ^[[:space:]]*#.*$ ]] && continue
-                [[ -z "$key" ]] && continue
-                
-                # Remove leading/trailing whitespace from key and value
-                key=$(echo "$key" | xargs)
-                value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                # Remove trailing comments from value if any
-                value=${value%%#*}
-                value=$(echo "$value" | xargs)
-                
-                case "$key" in
-                    UseHt) UseHt="$value" ;;
-                    DaemonMode) DaemonMode="$value" ;;
-                    SleepInterval) SleepInterval="$value" ;;
-                    StrictMem) StrictMem="$value" ;;
-                    IncludeNearby) IncludeNearby="$value" ;;
-                    MaxDist) MaxDist="$value" ;;
-                    OnlyGaming) OnlyGaming="$value" ;;
-                    SkipSystemTune) SkipSystemTune="$value" ;;
-                    DryRun) DryRun="$value" ;;
-                    DropPrivs) DropPrivs="$value" ;;
-                    MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
-                    GpuIndex) GpuIndexArg="$value" ;;
-                    SummaryInterval) SummaryInterval="$value" ;;
-                    SummarySilenceTimeout) SummarySilenceTimeout="$value" ;;
-                    HeaderInterval) HeaderInterval="$value" ;;
-                esac
-            done < "$file"
+            parse_config_file "$file"
         fi
     done
 }
@@ -116,21 +147,22 @@ DEV_PREFIX="${DEV_PREFIX:-}"
 status_log() {
     local pid="$1"
     local exe="$2"
-    local affinity="$3"
-    local status="$4"
-    local cmd="$5"
+    local simplified="$3"
+    local affinity="$4"
+    local status="$5"
+    local cmd="$6"
 
     if [ "$LogLineCount" -ge "$HeaderInterval" ]; then
         LogLineCount=0
 
-        echo "------------------------------------------------------------------------------------------------"
-        status_log "PID" "EXE" "ORIG AFFINITY" "STATUS" "COMMAND"
-        echo "------------------------------------------------------------------------------------------------"
+        echo "--------------------------------------------------------------------------------------------------------------------------------"
+        status_log "PID" "EXE" "SIMPLIFIED" "ORIG AFFINITY" "STATUS" "COMMAND"
+        echo "--------------------------------------------------------------------------------------------------------------------------------"
     fi
 
     [ -z "$pid" ] && return
 
-    printf "%-10s | %-15s | %-18s | %-25s | %s\n" "$pid" "$exe" "$affinity" "$status" "$cmd"
+    printf "%-10s | %-16s | %-20s | %-18s | %-25s | %s\n" "$pid" "$exe" "$simplified" "$affinity" "$status" "$cmd"
     ((LogLineCount++))
 }
 
@@ -283,7 +315,11 @@ detect_gpu() {
 }
 
 # Determines NUMA nodes and CPU list associated with the GPU
+# Can be called with specific settings to recalculate for a process.
 discover_resources() {
+    local l_include_nearby="${1:-$IncludeNearby}"
+    local l_max_dist="${2:-$MaxDist}"
+
     local device_sys_dir="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr"
     if [ ! -d "$device_sys_dir" ]; then
         echo "Error: PCI device directory $device_sys_dir not found."
@@ -294,8 +330,8 @@ discover_resources() {
     RawCpuList=$(cat "$device_sys_dir/local_cpulist" 2>/dev/null || echo "")
 
     NearbyNodeIds="$NumaNodeId"
-    if [ "$IncludeNearby" = true ]; then
-        NearbyNodeIds=$(get_nearby_nodes "$NumaNodeId")
+    if [ "$l_include_nearby" = true ]; then
+        NearbyNodeIds=$(get_nearby_nodes "$NumaNodeId" "$l_max_dist")
     fi
 
     if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "$NumaNodeId" ] && [ "$NearbyNodeIds" != "-1" ]; then
@@ -312,6 +348,7 @@ discover_resources() {
 # This uses 'numactl --hardware' to determine the relative distance between nodes.
 get_nearby_nodes() {
     local target_node=$1
+    local l_max_dist=$2
     local nearby=()
 
     if [ "$target_node" -lt 0 ]; then
@@ -324,7 +361,7 @@ get_nearby_nodes() {
         if [ -n "$distances" ]; then
             local i=0
             while read -r dist; do
-                if [ "$dist" -le "$MaxDist" ]; then
+                if [ "$dist" -le "$l_max_dist" ]; then
                     nearby+=("$i")
                 fi
                 ((i++))
@@ -408,9 +445,11 @@ normalize_affinity() {
 }
 
 # Filters the CPU list based on UseHt configuration
+# Can be called with specific settings to recalculate for a process.
 filter_cpus() {
+    local l_use_ht="${1:-$UseHt}"
     FinalCpuMask=""
-    if [ "$UseHt" = true ]; then
+    if [ "$l_use_ht" = true ]; then
         # If Hyper-Threading is allowed, use the full list of CPUs provided by the hardware
         FinalCpuMask="$RawCpuList"
     else
@@ -609,27 +648,74 @@ run_optimization() {
 
         if ! is_gaming_process "$pid"; then continue; fi
 
-        local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
-        [ -z "$raw_current_affinity" ] && continue
-        local current_normalized_mask=$(normalize_affinity "$raw_current_affinity")
         local proc_comm=$(ps -p "$pid" -o comm=)
         local full_proc_cmd=$(ps -fp "$pid" -o args= | tail -n 1)
         [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
-        if [ "$current_normalized_mask" != "$TargetNormalizedMask" ]; then
+        # Extract a simplified executable name for configuration lookups and notifications
+        local simplified_cmd=""
+        if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
+            simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
+        elif [ "$full_proc_cmd" != "[Hidden or Exited]" ]; then
+            simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
+        fi
+        # Ensure simplified_cmd is not empty
+        [ -z "$simplified_cmd" ] && simplified_cmd="$proc_comm"
+        [ -z "$simplified_cmd" ] && simplified_cmd="Process $pid"
+
+        # Load per-process configuration (overrides global settings)
+        # We store current globals to restore them after this process
+        local old_UseHt="$UseHt"
+        local old_IncludeNearby="$IncludeNearby"
+        local old_MaxDist="$MaxDist"
+        local old_StrictMem="$StrictMem"
+        
+        load_process_config "$simplified_cmd"
+
+        # Recalculate masks if settings changed for this process
+        local l_FinalCpuMask="$FinalCpuMask"
+        local l_TargetNormalizedMask="$TargetNormalizedMask"
+        local l_NearbyNodeIds="$NearbyNodeIds"
+
+        if [ "$UseHt" != "$old_UseHt" ] || [ "$IncludeNearby" != "$old_IncludeNearby" ] || [ "$MaxDist" != "$old_MaxDist" ]; then
+            # Backup current global RawCpuList and other state used by filter_cpus/discover_resources
+            local old_RawCpuList="$RawCpuList"
+            local old_NumaNodeId="$NumaNodeId"
+
+            discover_resources "$IncludeNearby" "$MaxDist"
+            filter_cpus "$UseHt"
+
+            l_FinalCpuMask="$FinalCpuMask"
+            l_TargetNormalizedMask="$TargetNormalizedMask"
+            l_NearbyNodeIds="$NearbyNodeIds"
+
+            # Restore globals for next processes (unless they have their own config)
+            RawCpuList="$old_RawCpuList"
+            NumaNodeId="$old_NumaNodeId"
+        fi
+
+        local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
+        if [ -z "$raw_current_affinity" ]; then
+             # Restore globals before continue
+             UseHt="$old_UseHt"; IncludeNearby="$old_IncludeNearby"; MaxDist="$old_MaxDist"; StrictMem="$old_StrictMem"
+             continue
+        fi
+        local current_normalized_mask=$(normalize_affinity "$raw_current_affinity")
+
+        if [ "$current_normalized_mask" != "$l_TargetNormalizedMask" ]; then
             if [ "$DryRun" = false ]; then
-                taskset -pc "$FinalCpuMask" "$pid" > /dev/null 2>&1
+                taskset -pc "$l_FinalCpuMask" "$pid" > /dev/null 2>&1
 
                 if [ "$StrictMem" = true ]; then
-                    numactl --membind="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
+                    numactl --membind="${l_NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
                 else
                     # Preferred policy: try multiple nodes if available, fallback to single
-                    if [[ "$NearbyNodeIds" == *","* ]]; then
-                        if ! numactl --preferred-many="$NearbyNodeIds" -p "$pid" > /dev/null 2>&1; then
-                             numactl --preferred="${NearbyNodeIds%%,*}" -p "$pid" > /dev/null 2>&1
+                    if [[ "$l_NearbyNodeIds" == *","* ]]; then
+                        if ! numactl --preferred-many="$l_NearbyNodeIds" -p "$pid" > /dev/null 2>&1; then
+                             numactl --preferred="${l_NearbyNodeIds%%,*}" -p "$pid" > /dev/null 2>&1
                         fi
                     else
-                        numactl --preferred="${NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
+                        numactl --preferred="${l_NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
                     fi
                 fi
             fi
@@ -637,37 +723,21 @@ run_optimization() {
             local process_rss_kb=$(awk '/VmRSS/ {print $2}' "$PROC_PREFIX/proc/$pid/status" 2>/dev/null || echo 0)
             local safety_margin_kb=524288
 
-            # Extract a simplified executable name for notifications
-            local simplified_cmd=""
-            if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
-                simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
-            elif [ "$full_proc_cmd" != "[Hidden or Exited]" ]; then
-                simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
-            fi
-            # Ensure simplified_cmd is not empty
-            [ -z "$simplified_cmd" ] && simplified_cmd="$proc_comm"
-            [ -z "$simplified_cmd" ] && simplified_cmd="Process $pid"
-
             # Determine memory availability on target nodes to decide if migration is safe.
-            # Page migration (moving memory already allocated) requires enough free space
-            # on the destination NUMA node to avoid triggering OOM or excessive swapping.
             local free_kb=0
-            if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "-1" ]; then
-                IFS=',' read -ra nodes <<< "$NearbyNodeIds"
+            if [ -n "$l_NearbyNodeIds" ] && [ "$l_NearbyNodeIds" != "-1" ]; then
+                IFS=',' read -ra nodes <<< "$l_NearbyNodeIds"
                 for node in "${nodes[@]}"; do
                     free_kb=$((free_kb + $(get_node_free_kb "$node")))
                 done
             elif [ "$NumaNodeId" -ge 0 ]; then
                 free_kb=$(get_node_free_kb "$NumaNodeId")
             else
-                # No specific NUMA node detected; migration is not possible.
                 free_kb=0
             fi
 
             # Migrate pages if there's enough free memory (with a safety margin).
-            # We use 'migratepages' to move all existing memory pages of the process
-            # to the target NUMA nodes identified earlier.
-            local target_nodes="${NearbyNodeIds:-$NumaNodeId}"
+            local target_nodes="${l_NearbyNodeIds:-$NumaNodeId}"
             if [[ "$target_nodes" != "-1" ]] && [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
                 if [ "$DryRun" = false ]; then
                     if migratepages "$pid" all "$target_nodes" > /dev/null 2>&1; then
@@ -692,7 +762,7 @@ run_optimization() {
 
             # Queue for notification
             PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|$target_nodes|$process_rss_kb")
-            status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
+            status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
 
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 ((TotalOptimizedCount++))
@@ -700,9 +770,9 @@ run_optimization() {
                 LastOptimizationTime=$(date +%s)
                 SummarySilenced=false
                 if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
-                    # Log entry format: TIMESTAMP | PID | COMM | STATUS | NODES | COMMAND
-                    printf "%-19s | %-8s | %-16s | %-22s | %-8s | %s\n" \
-                        "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$status_msg" "$target_nodes" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
+                    # Log entry format: TIMESTAMP | PID | COMM | SIMPLIFIED | STATUS | NODES | COMMAND
+                    printf "%-19s | %-8s | %-16s | %-20s | %-22s | %-8s | %s\n" \
+                        "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$simplified_cmd" "$status_msg" "$target_nodes" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
                     trim_all_time_log
                 fi
             fi
@@ -711,12 +781,18 @@ run_optimization() {
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 local status_msg="OPTIMIZED"
                 [ "$DryRun" = true ] && status_msg="DRY RUN ($status_msg)"
-                status_log "$pid" "$proc_comm" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
+                status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
                 OptimizedPidsMap[$pid]=$(date +%s)
                 LastOptimizationTime=$(date +%s)
                 SummarySilenced=false
             fi
         fi
+
+        # Restore globals for next process in the loop
+        UseHt="$old_UseHt"
+        IncludeNearby="$old_IncludeNearby"
+        MaxDist="$old_MaxDist"
+        StrictMem="$old_StrictMem"
     done
 }
 
@@ -765,8 +841,8 @@ summarize_optimizations() {
             return
         fi
 
-        echo "------------------------------------------------------------------------------------------------"
-        status_log "$TotalOptimizedCount procs" "since startup" "$LifetimeOptimizedCount all time" "$summary_status" "$summary_msg"
+        echo "--------------------------------------------------------------------------------------------------------------------------------"
+        status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "$summary_status" "$summary_msg"
 
         # Sort PIDs numerically for consistent output
         local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
@@ -777,7 +853,17 @@ summarize_optimizations() {
             local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
             [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
-            status_log "$pid" "$proc_comm" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
+            # Re-extract simplified_cmd for summary
+            local simplified_cmd=""
+            if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
+                simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
+            elif [ "$full_proc_cmd" != "[Hidden or Exited]" ]; then
+                simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
+            fi
+            [ -z "$simplified_cmd" ] && simplified_cmd="$proc_comm"
+            [ -z "$simplified_cmd" ] && simplified_cmd="Process $pid"
+
+            status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
         done
 
         LastSummaryTime=$now
@@ -883,6 +969,7 @@ print_banner() {
     echo "DRY RUN MODE     : $( [ "$DryRun" = true ] && echo "ENABLED (No changes will be applied)" || echo "Disabled" )"
     echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
 
+    echo "--------------------------------------------------------------------------------------------------------------------------------"
     status_log
 }
 
@@ -926,7 +1013,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             # If optimizations were performed, wait a short while for related processes
             # (e.g., a game launcher starting the game engine) to appear.
             if [ ${#PendingOptimizations[@]} -gt 0 ]; then
-                log "Optimized ${#PendingOptimizations[@]} process(es). Waiting ${SleepInterval} to aggregate more..."
+                log "Optimized ${#PendingOptimizations[@]} process(es). Waiting ${SleepInterval}s to aggregate more..."
                 sleep "$SleepInterval"
                 # Run one more time to catch immediate followers
                 run_optimization
