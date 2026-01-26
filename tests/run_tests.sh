@@ -553,6 +553,14 @@ assert_eq "false" "$OnlyGaming" "CLI override: OnlyGaming (set to false by -a)"
 
 rm -rf tests/mock_etc
 
+echo "--------------------------------------------------------------------------------"
+if [ $FAILED -eq 0 ]; then
+    echo -e "${GREEN}ALL TESTS PASSED ($PASSED)${NC}"
+else
+    echo -e "${RED}TESTS FAILED ($FAILED failed, $PASSED passed, $((PASSED + FAILED)) total)${NC}"
+fi
+echo "--------------------------------------------------------------------------------"
+
 if [ $FAILED -gt 0 ]; then
     exit 1
 fi
