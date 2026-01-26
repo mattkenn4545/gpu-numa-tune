@@ -471,6 +471,87 @@ assert_eq "10" "$(wc -l < "$AllTimeFile")" "trim_all_time_log trims to MaxAllTim
 assert_eq "line52" "$(head -n 1 "$AllTimeFile")" "trim_all_time_log keeps most recent entries (line52)"
 assert_eq "line61" "$(tail -n 1 "$AllTimeFile")" "trim_all_time_log keeps most recent entries (line61)"
 
+# Test 13: Configuration loading
+echo "Test 13: Configuration loading"
+mkdir -p tests/mock_etc
+mock_conf="tests/mock_etc/gpu-numa-tune.conf"
+cat > "$mock_conf" <<EOF
+UseHt=false
+DaemonMode=true
+SleepInterval=5
+StrictMem=true
+IncludeNearby=false
+MaxDist=15
+OnlyGaming=false
+SkipSystemTune=true
+DryRun=true
+DropPrivs=false
+MaxAllTimeLogLines=5000
+GpuIndex=2
+EOF
+
+# Redefine load_config to use our mock etc path
+# Actually we can just override the config_files array if it wasn't local to the function, 
+# but it is. So we override the function for the test.
+load_config() {
+    local config_files=("$mock_conf")
+    for file in "${config_files[@]}"; do
+        if [ -f "$file" ]; then
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+                [[ "$key" =~ ^[[:space:]]*#.*$ ]] && continue
+                [[ -z "$key" ]] && continue
+                key=$(echo "$key" | xargs)
+                value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                value=${value%%#*}
+                value=$(echo "$value" | xargs)
+                case "$key" in
+                    UseHt) UseHt="$value" ;;
+                    DaemonMode) DaemonMode="$value" ;;
+                    SleepInterval) SleepInterval="$value" ;;
+                    StrictMem) StrictMem="$value" ;;
+                    IncludeNearby) IncludeNearby="$value" ;;
+                    MaxDist) MaxDist="$value" ;;
+                    OnlyGaming) OnlyGaming="$value" ;;
+                    SkipSystemTune) SkipSystemTune="$value" ;;
+                    DryRun) DryRun="$value" ;;
+                    DropPrivs) DropPrivs="$value" ;;
+                    MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
+                    GpuIndex) GpuIndexArg="$value" ;;
+                esac
+            done < "$file"
+        fi
+    done
+}
+
+load_config
+assert_eq "false" "$UseHt" "Config: UseHt"
+assert_eq "true" "$DaemonMode" "Config: DaemonMode"
+assert_eq "5" "$SleepInterval" "Config: SleepInterval"
+assert_eq "true" "$StrictMem" "Config: StrictMem"
+assert_eq "false" "$IncludeNearby" "Config: IncludeNearby"
+assert_eq "15" "$MaxDist" "Config: MaxDist"
+assert_eq "false" "$OnlyGaming" "Config: OnlyGaming"
+assert_eq "true" "$SkipSystemTune" "Config: SkipSystemTune"
+assert_eq "true" "$DryRun" "Config: DryRun"
+assert_eq "false" "$DropPrivs" "Config: DropPrivs"
+assert_eq "5000" "$MaxAllTimeLogLines" "Config: MaxAllTimeLogLines"
+assert_eq "2" "$GpuIndexArg" "Config: GpuIndex"
+
+# Test 14: CLI overrides Config
+echo "Test 14: CLI overrides Config"
+# Previous test left config values set
+parse_args "--physical-only" "--daemon" "--strict" "1"
+assert_eq "false" "$UseHt" "CLI override: UseHt (already false but still)"
+assert_eq "true" "$DaemonMode" "CLI override: DaemonMode"
+assert_eq "true" "$StrictMem" "CLI override: StrictMem"
+assert_eq "1" "$GpuIndexArg" "CLI override: GpuIndex"
+
+# Change some back
+parse_args "-a" "-n"
+assert_eq "false" "$OnlyGaming" "CLI override: OnlyGaming (set to false by -a)"
+
+rm -rf tests/mock_etc
+
 if [ $FAILED -gt 0 ]; then
     exit 1
 fi

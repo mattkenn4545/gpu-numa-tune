@@ -57,27 +57,65 @@ sudo ./install.sh
 
 The installer will copy the script to `/usr/local/bin`, set up a systemd service, and start it immediately.
 
-### 3. Tweaking Settings
+### 3. Configuration
 
-The optimizer is designed to work out-of-the-box, but you can customize its behavior by editing the systemd service file or running the script manually.
+The optimizer can be configured via persistent configuration files. Settings are loaded in the following order (later files override earlier ones):
+
+1.  `/etc/gpu-numa-tune.conf` (System-wide)
+2.  `~/.config/gpu-numa-tune.conf` (User-specific)
+3.  `./gpu-numa-tune.conf` (Local directory)
+
+**Note:** Command-line options always take precedence over configuration file values.
+
+#### Format:
+The configuration file uses a simple `KEY=VALUE` format. Lines starting with `#` are ignored as comments.
+
+```ini
+# Example configuration
+UseHt=true
+DaemonMode=true
+SleepInterval=10
+GpuIndex=0
+```
+
+#### Available Options:
+
+| Key | Description | Default |
+| :--- | :--- | :--- |
+| `UseHt` | Use SMT/HT sibling cores (`true`/`false`) | `true` |
+| `DaemonMode` | Run in daemon mode (`true`/`false`) | `false` |
+| `SleepInterval` | Seconds to wait between checks in daemon mode | `10` |
+| `StrictMem` | Use `membind` (fails if node full) instead of `preferred` | `false` |
+| `IncludeNearby` | Include "nearby" NUMA nodes based on distance | `true` |
+| `MaxDist` | Max distance from `numactl -H` for "nearby" nodes | `11` |
+| `OnlyGaming` | Only optimize games and high-perf apps | `true` |
+| `SkipSystemTune` | Skip modifying `sysctl` or CPU governors | `false` |
+| `DryRun` | Log intended changes without applying them | `false` |
+| `DropPrivs` | Drop root privileges after system tuning | `true` |
+| `MaxAllTimeLogLines` | Max lines to keep in `~/.gpu_numa_optimizations` | `10000` |
+| `GpuIndex` | Default GPU index to target | `0` |
+| `SummaryInterval` | Interval between periodic summary reports (seconds) | `1800` |
+| `SummarySilenceTimeout` | Stop summaries after inactivity (seconds) | `7200` |
+| `HeaderInterval` | Number of log lines before repeating table header | `20` |
+
+### 4. Command-Line Usage
+
+While the configuration file is recommended for persistent settings, you can override any setting via command-line arguments.
 
 **Usage:**
 `sudo ./gpu_optimize.sh [options] [gpu_index]`
 
 **Common Options:**
-- `-p, --physical-only`: Skip SMT/Hyper-threading siblings (often better for gaming).
-- `-d, --daemon`: Run in daemon mode (periodically checks for new processes every 10s).
-- `-s, --strict`: Strict memory policy (OOM risk if node is small, but maximum performance).
-- `-l, --local-only`: Use only the GPU's local NUMA node (ignore nearby nodes).
-- `-a, --all-gpu-procs`: Optimize *every* process using the GPU, not just games.
-- `-x, --no-tune`: Skip system-level kernel tuning (sysctl, etc.).
-- `-n, --dry-run`: Dry-run mode. Don't apply any changes, just show what would be done.
-- `-m, --max-log-lines`: Set the maximum number of lines for the all-time optimization log (default: 10000).
-- `-k, --no-drop`: Do not drop root privileges (useful for certain troubleshooting).
+- `-p, --physical-only`: Skip SMT/Hyper-threading siblings (sets `UseHt=false`).
+- `-d, --daemon`: Run in daemon mode (sets `DaemonMode=true`).
+- `-s, --strict`: Strict memory policy (sets `StrictMem=true`).
+- `-l, --local-only`: Use only local node (sets `IncludeNearby=false`).
+- `-a, --all-gpu-procs`: Optimize all GPU processes (sets `OnlyGaming=false`).
+- `-x, --no-tune`: Skip system-level kernel tuning (sets `SkipSystemTune=true`).
+- `-n, --dry-run`: Dry-run mode (sets `DryRun=true`).
+- `-m, --max-log-lines`: Set max log lines (sets `MaxAllTimeLogLines`).
+- `-k, --no-drop`: Do not drop root privileges (sets `DropPrivs=false`).
 - `-h, --help`: Show full usage information.
-
-**Arguments:**
-- `gpu_index`: The index of the GPU to target (default: 0). Use `lspci` to see your devices.
 
 **To edit the service settings:**
 1. Run `sudo systemctl edit --full gpu-numa-optimizer.service`

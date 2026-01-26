@@ -36,6 +36,51 @@ SkipSystemTune=false         # If true, do not attempt to modify sysctl or CPU g
 DryRun=false                 # If true, log intended changes but do not apply them
 DropPrivs=true               # If true, drop from root to the logged-in user after system tuning
 MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time optimization log
+GpuIndexArg=0                # Default GPU index
+
+# Load configuration from files
+load_config() {
+    local config_files=(
+        "/etc/gpu-numa-tune.conf"
+        "$HOME/.config/gpu-numa-tune.conf"
+        "$(pwd)/gpu-numa-tune.conf"
+    )
+
+    for file in "${config_files[@]}"; do
+        if [ -f "$file" ]; then
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+                # Ignore comments and empty lines
+                [[ "$key" =~ ^[[:space:]]*#.*$ ]] && continue
+                [[ -z "$key" ]] && continue
+                
+                # Remove leading/trailing whitespace from key and value
+                key=$(echo "$key" | xargs)
+                value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                # Remove trailing comments from value if any
+                value=${value%%#*}
+                value=$(echo "$value" | xargs)
+                
+                case "$key" in
+                    UseHt) UseHt="$value" ;;
+                    DaemonMode) DaemonMode="$value" ;;
+                    SleepInterval) SleepInterval="$value" ;;
+                    StrictMem) StrictMem="$value" ;;
+                    IncludeNearby) IncludeNearby="$value" ;;
+                    MaxDist) MaxDist="$value" ;;
+                    OnlyGaming) OnlyGaming="$value" ;;
+                    SkipSystemTune) SkipSystemTune="$value" ;;
+                    DryRun) DryRun="$value" ;;
+                    DropPrivs) DropPrivs="$value" ;;
+                    MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
+                    GpuIndex) GpuIndexArg="$value" ;;
+                    SummaryInterval) SummaryInterval="$value" ;;
+                    SummarySilenceTimeout) SummarySilenceTimeout="$value" ;;
+                    HeaderInterval) HeaderInterval="$value" ;;
+                esac
+            done < "$file"
+        fi
+    done
+}
 
 # State Tracking
 declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
@@ -846,7 +891,9 @@ print_banner() {
 # Entry point of the script. Handles initialization, privilege dropping, 
 # and enters the main daemon loop or performs a single-run optimization.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    echo "------------------------------------------------------------------------------------------------"
+    # Load configuration from files first (system-wide, then user-specific, then local)
+    load_config
+    # Parse CLI arguments (they override configuration files)
     parse_args "$@"
     check_dependencies
     system_tune
