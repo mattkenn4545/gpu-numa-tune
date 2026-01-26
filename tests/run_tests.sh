@@ -430,7 +430,7 @@ output=$(
     summarize_optimizations true
 )
 
-assert_eq "0 procs    | since startup    |                      | 5 all time         | SCANNING                  | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
+assert_eq "0 procs    | since startup    |                      | 5 all time         | SCANNING                  |                          " "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
 
 # Test 11b: Startup summary -l option
 echo "Test 11b: Startup summary -l option"

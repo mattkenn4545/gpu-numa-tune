@@ -154,22 +154,22 @@ PcieWarningLogged=false
 status_log() {
     local pid="$1"
     local exe="$2"
-    local simplified="$3"
+    local cmd="$3"
     local affinity="$4"
     local status="$5"
-    local cmd="$6"
+    local overrides="$6"
 
     if [ "$LogLineCount" -ge "$HeaderInterval" ]; then
         LogLineCount=0
 
         echo "--------------------------------------------------------------------------------------------------------------------------------"
-        status_log "PID" "EXE" "SIMPLIFIED" "ORIG AFFINITY" "STATUS" "COMMAND"
+        status_log "PID" "EXE" "CMD" "ORIG AFFINITY" "STATUS" "OVERRIDES"
         echo "--------------------------------------------------------------------------------------------------------------------------------"
     fi
 
     [ -z "$pid" ] && return
 
-    printf "%-10s | %-16s | %-20s | %-18s | %-25s | %s\n" "$pid" "$exe" "$simplified" "$affinity" "$status" "$cmd"
+    printf "%-10s | %-16s | %-20s | %-18s | %-25s | %-25s\n" "$pid" "$exe" "$cmd" "$affinity" "$status" "$overrides"
     ((LogLineCount++))
 }
 
@@ -540,6 +540,21 @@ get_simplified_cmd() {
     echo "$simplified_cmd"
 }
 
+# Returns a comma-separated string of per-process configuration overrides
+get_overrides() {
+    local old_ht="$1"
+    local old_nearby="$2"
+    local old_dist="$3"
+    local old_strict="$4"
+    
+    local overrides=""
+    [ "$UseHt" != "$old_ht" ] && overrides+="UseHt=$UseHt,"
+    [ "$IncludeNearby" != "$old_nearby" ] && overrides+="IncludeNearby=$IncludeNearby,"
+    [ "$MaxDist" != "$old_dist" ] && overrides+="MaxDist=$MaxDist,"
+    [ "$StrictMem" != "$old_strict" ] && overrides+="StrictMem=$StrictMem,"
+    echo "${overrides%,}"
+}
+
 # Determines if a PID should be optimized based on its environment and command line.
 # This function applies several layers of heuristics to identify games:
 # 1. Checks a blacklist of common desktop/system apps (browsers, shells, etc.).
@@ -760,6 +775,9 @@ run_optimization() {
         local old_StrictMem="$StrictMem"
         
         load_process_config "$simplified_cmd"
+        
+        # Calculate overrides for display
+        local overrides=$(get_overrides "$old_UseHt" "$old_IncludeNearby" "$old_MaxDist" "$old_StrictMem")
 
         # Recalculate masks if settings changed for this process
         local l_FinalCpuMask="$FinalCpuMask"
@@ -854,7 +872,7 @@ run_optimization() {
 
             # Queue for notification
             PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|$target_nodes|$process_rss_kb")
-            status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
+            status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "$status_msg" "$overrides"
 
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 ((TotalOptimizedCount++))
@@ -862,9 +880,9 @@ run_optimization() {
                 LastOptimizationTime=$(date +%s)
                 SummarySilenced=false
                 if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
-                    # Log entry format: TIMESTAMP | PID | COMM | SIMPLIFIED | STATUS | NODES | COMMAND
-                    printf "%-19s | %-8s | %-16s | %-20s | %-22s | %-8s | %s\n" \
-                        "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$simplified_cmd" "$status_msg" "$target_nodes" "$full_proc_cmd" >> "$AllTimeFile" 2>/dev/null
+                    # Log entry format: TIMESTAMP | PID | COMM | CMD | STATUS | NODES
+                    printf "%-19s | %-8s | %-16s | %-20s | %-22s | %-8s\n" \
+                        "$(date "+%Y-%m-%d %H:%M:%S")" "$pid" "$proc_comm" "$simplified_cmd" "$status_msg" "$target_nodes" >> "$AllTimeFile" 2>/dev/null
                     trim_all_time_log
                 fi
             fi
@@ -873,7 +891,7 @@ run_optimization() {
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 local status_msg="OPTIMIZED"
                 [ "$DryRun" = true ] && status_msg="DRY RUN ($status_msg)"
-                status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "$status_msg" "$full_proc_cmd"
+                status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "$status_msg" "$overrides"
                 OptimizedPidsMap[$pid]=$(date +%s)
                 LastOptimizationTime=$(date +%s)
                 SummarySilenced=false
@@ -933,7 +951,7 @@ summarize_optimizations() {
             return
         fi
 
-        status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "$summary_status" "$summary_msg"
+        status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "$summary_status" ""
 
         PcieWarningLogged=false
         if [ "$current_optimized_count" -gt 0 ]; then
@@ -952,7 +970,20 @@ summarize_optimizations() {
             # Re-extract simplified_cmd for summary
             local simplified_cmd=$(get_simplified_cmd "$pid" "$proc_comm" "$full_proc_cmd")
 
-            status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
+            # Load per-process configuration to find overrides for summary
+            local old_UseHt="$UseHt"
+            local old_IncludeNearby="$IncludeNearby"
+            local old_MaxDist="$MaxDist"
+            local old_StrictMem="$StrictMem"
+            
+            load_process_config "$simplified_cmd"
+            
+            local overrides=$(get_overrides "$old_UseHt" "$old_IncludeNearby" "$old_MaxDist" "$old_StrictMem")
+
+            status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$overrides"
+
+            # Restore globals
+            UseHt="$old_UseHt"; IncludeNearby="$old_IncludeNearby"; MaxDist="$old_MaxDist"; StrictMem="$old_StrictMem"
         done
 
         LastSummaryTime=$now
