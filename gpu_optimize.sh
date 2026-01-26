@@ -861,7 +861,6 @@ summarize_optimizations() {
             return
         fi
 
-        echo "--------------------------------------------------------------------------------------------------------------------------------"
         status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "$summary_status" "$summary_msg"
 
         # Sort PIDs numerically for consistent output
