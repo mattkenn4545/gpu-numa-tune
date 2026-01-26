@@ -74,6 +74,9 @@ OnlyGaming=true
 # Skip system-level tuning (sysctl, etc.) (true/false)
 SkipSystemTune=false
 
+# Force max PCIe performance (disable ASPM/Runtime PM) (true/false)
+MaxPerf=false
+
 # Dry-run mode (true/false)
 DryRun=false
 

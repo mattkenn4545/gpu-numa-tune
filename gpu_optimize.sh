@@ -33,6 +33,7 @@ IncludeNearby=true           # If true, include "nearby" NUMA nodes in addition 
 MaxDist=11                   # Maximum distance value from 'numactl -H' to consider a node "nearby"
 OnlyGaming=true              # If true, only optimize processes identified as games or high-perf apps
 SkipSystemTune=false         # If true, do not attempt to modify sysctl or CPU governors
+MaxPerf=false                # If true, force PCIe device and ASPM to maximum performance
 DryRun=false                 # If true, log intended changes but do not apply them
 DropPrivs=true               # If true, drop from root to the logged-in user after system tuning
 MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time optimization log
@@ -77,6 +78,7 @@ parse_config_file() {
             MaxDist) MaxDist="$value" ;;
             OnlyGaming) OnlyGaming="$value" ;;
             SkipSystemTune) SkipSystemTune="$value" ;;
+            MaxPerf) MaxPerf="$value" ;;
             DryRun) DryRun="$value" ;;
             DropPrivs) DropPrivs="$value" ;;
             MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
@@ -145,6 +147,9 @@ SYSFS_PREFIX="${SYSFS_PREFIX:-}"
 PROC_PREFIX="${PROC_PREFIX:-}"
 DEV_PREFIX="${DEV_PREFIX:-}"
 
+# State for PCIe warning to ensure it's only logged once per summary
+PcieWarningLogged=false
+
 # Displays a formatted table row for process optimization status
 status_log() {
     local pid="$1"
@@ -187,6 +192,7 @@ usage() {
     echo "  -l, --local-only     Use only the GPU's local NUMA node (ignore nearby nodes)"
     echo "  -a, --all-gpu-procs  Optimize ALL processes using the GPU (not just games)"
     echo "  -x, --no-tune        Skip system-level tuning (sysctl, etc.)"
+    echo "  -f, --max-perf       Force max PCIe performance (disable ASPM/Runtime PM)"
     echo "  -n, --dry-run        Dry-run mode (don't apply any changes)"
     echo "  -k, --no-drop        Keep root privileges (do not drop to user)"
     echo "  -m, --max-log-lines  Maximum all-time log lines (default: $MaxAllTimeLogLines)"
@@ -267,6 +273,32 @@ flush_notifications() {
 }
 
 # --- System Discovery & Hardware Info ---
+
+# Checks if the GPU is running at its maximum PCIe link speed and width.
+# Logs a warning if it's not.
+check_pcie_speed() {
+    [ "$PcieWarningLogged" = true ] && return
+    local device_sys_dir="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr"
+    [ ! -d "$device_sys_dir" ] && return
+
+    local cur_speed=$(cat "$device_sys_dir/current_link_speed" 2>/dev/null)
+    local max_speed=$(cat "$device_sys_dir/max_link_speed" 2>/dev/null)
+    local cur_width=$(cat "$device_sys_dir/current_link_width" 2>/dev/null)
+    local max_width=$(cat "$device_sys_dir/max_link_width" 2>/dev/null)
+
+    local warned=false
+    if [ -n "$cur_speed" ] && [ -n "$max_speed" ] && [ "$cur_speed" != "$max_speed" ]; then
+        log "WARNING: GPU is not running at max PCIe speed! Current: $cur_speed, Max: $max_speed"
+        warned=true
+    fi
+
+    if [ -n "$cur_width" ] && [ -n "$max_width" ] && [ "$cur_width" != "$max_width" ]; then
+        log "WARNING: GPU is not running at max PCIe width! Current: x$cur_width, Max: x$max_width"
+        warned=true
+    fi
+    
+    [ "$warned" = true ] && PcieWarningLogged=true
+}
 
 # Identifies the GPU's PCI address based on the provided index.
 detect_gpu() {
@@ -566,7 +598,10 @@ is_gaming_process() {
 system_tune() {
     [ "$SkipSystemTune" = true ] && return
 
-    if [ "$EUID" -eq 0 ]; then
+    # Determine effective EUID (allowing for mocking in tests)
+    local eff_euid="${MOCK_EUID:-$EUID}"
+
+    if [ "$eff_euid" -eq 0 ]; then
         echo "--> Root detected. Applying system-wide optimizations..."
 
         set_sysctl() {
@@ -574,9 +609,10 @@ system_tune() {
             local value="$2"
             local label="$3"
             # Check if the sysctl key exists before attempting to set it
-            local sys_path="/proc/sys/${key//./\/}"
+            local sys_path="$PROC_PREFIX/proc/sys/${key//./\/}"
             if [ -f "$sys_path" ] || sysctl "$key" >/dev/null 2>&1; then
                 if [ "$DryRun" = false ]; then
+                    SYSCTL_CALLED=true
                     if sysctl -w "$key=$value" >/dev/null 2>&1; then
                         printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$value" "$label"
                     else
@@ -609,19 +645,55 @@ system_tune() {
         set_sysctl "vm.stat_interval" "10" "Jitter Reduction"
         # kernel.nmi_watchdog: Disabled to reduce periodic interrupts that can cause micro-stutters.
         set_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
+        
+        # PCIe Max Performance: Disables power management for the GPU and sets global ASPM policy
+        if [ "$MaxPerf" = true ]; then
+            # 1. Global ASPM policy to performance
+            if [ -f "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy" ]; then
+                if [ "$DryRun" = false ]; then
+                    echo "performance" > "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy" 2>/dev/null
+                    printf "  [OK] %-30s -> %-10s (%s)\n" "pcie_aspm_policy" "performance" "PCIe Perf"
+                else
+                    printf "  [DRY] %-29s -> %-10s (%s)\n" "pcie_aspm_policy" "performance" "PCIe Perf"
+                fi
+            fi
+
+            # 2. Disable GPU Runtime Power Management
+            if [ -f "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control" ]; then
+                if [ "$DryRun" = false ]; then
+                    echo "on" > "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control" 2>/dev/null
+                    printf "  [OK] %-30s -> %-10s (%s)\n" "gpu_runtime_pm" "off" "PCIe Perf"
+                else
+                    printf "  [DRY] %-29s -> %-10s (%s)\n" "gpu_runtime_pm" "off" "PCIe Perf"
+                fi
+            fi
+
+            # 3. Disable GPU ASPM L1 and Clock PM if supported
+            for link_file in "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/l1_aspm" "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/clkpm"; do
+                if [ -f "$link_file" ]; then
+                    local link_name=$(basename "$link_file")
+                    if [ "$DryRun" = false ]; then
+                        echo "0" > "$link_file" 2>/dev/null
+                        printf "  [OK] %-30s -> %-10s (%s)\n" "gpu_$link_name" "disabled" "PCIe Perf"
+                    else
+                        printf "  [DRY] %-29s -> %-10s (%s)\n" "gpu_$link_name" "disabled" "PCIe Perf"
+                    fi
+                fi
+            done
+        fi
 
         # Transparency Hugepages (THP): 'never' or 'madvise' reduces micro-stutters in games
-        if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+        if [ -f "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" ]; then
             if [ "$DryRun" = false ]; then
-                echo "never" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+                echo "never" > "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" 2>/dev/null
                 printf "  [OK] %-30s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
             else
                 printf "  [DRY] %-29s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
             fi
         fi
-        if [ -f /sys/kernel/mm/transparent_hugepage/defrag ]; then
+        if [ -f "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" ]; then
             if [ "$DryRun" = false ]; then
-                echo "never" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null
+                echo "never" > "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" 2>/dev/null
                 printf "  [OK] %-30s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
             else
                 printf "  [DRY] %-29s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
@@ -629,9 +701,9 @@ system_tune() {
         fi
 
         # CPU Scaling Governor: Set to 'performance' for all cores
-        if [ -d /sys/devices/system/cpu/cpufreq ]; then
+        if [ -d "$SYSFS_PREFIX/sys/devices/system/cpu/cpufreq" ]; then
             if [ "$DryRun" = false ]; then
-                for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+                for gov in "$SYSFS_PREFIX"/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
                     [ -f "$gov" ] && echo "performance" > "$gov" 2>/dev/null
                 done
                 printf "  [OK] %-30s -> %-10s (%s)\n" "cpu_governor" "performance" "Power/Perf"
@@ -863,6 +935,11 @@ summarize_optimizations() {
 
         status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "$summary_status" "$summary_msg"
 
+        PcieWarningLogged=false
+        if [ "$current_optimized_count" -gt 0 ]; then
+            check_pcie_speed
+        fi
+
         # Sort PIDs numerically for consistent output
         local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 
@@ -929,6 +1006,7 @@ parse_args() {
             -l|--local-only) IncludeNearby=false; shift ;;
             -a|--all-gpu-procs) OnlyGaming=false; shift ;;
             -x|--no-tune) SkipSystemTune=true; shift ;;
+            -f|--max-perf) MaxPerf=true; shift ;;
             -n|--dry-run) DryRun=true; shift ;;
             -k|--no-drop) DropPrivs=false; shift ;;
             -m|--max-log-lines) 
@@ -992,10 +1070,12 @@ print_banner() {
     echo "CPU TARGETS      : $( [ "$UseHt" = true ] && echo "HT Allowed" || echo "Physical Only" ) ($FinalCpuMask)"
     echo "MEM POLICY       : $mem_policy_label"
     echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
+    echo "PCIe PERF        : $( [ "$MaxPerf" = true ] && echo "Max (ASPM Disabled)" || echo "Default" )"
     echo "DRY RUN MODE     : $( [ "$DryRun" = true ] && echo "ENABLED (No changes will be applied)" || echo "Disabled" )"
     echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"
 
     echo "--------------------------------------------------------------------------------------------------------------------------------"
+    check_pcie_speed
     status_log
 }
 

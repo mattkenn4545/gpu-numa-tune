@@ -13,7 +13,9 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **🎯 Precision Pinning:** Automatically detects your GPU's physical NUMA node and pins game threads to the most efficient CPU cores.
 - **🧠 Intelligent Memory Migration:** Moves existing game memory allocations to the GPU's local NUMA node in real-time.
 - **🕹️ Gaming-Aware Heuristics:** Automatically identifies games from Steam, Proton, Wine, Lutris, and Heroic by inspecting environment variables and process ancestry, while ignoring background apps like browsers or Discord.
-- **⚡ System-Level Tuning:** Optimizes kernel parameters (`sysctl`), CPU governors, and Transparent Hugepages (THP) for reduced scheduling latency and improved memory mapping.
+- **⚡ System-Level Tuning:** Optimizes kernel parameters (`sysctl`), CPU governors, PCIe power management, and Transparent Hugepages (THP) for reduced scheduling latency and improved memory mapping.
+- **🏎️ Max Performance Mode:** Optional high-performance mode that forces the GPU and PCIe bus to stay in their highest power states, preventing micro-stutter from power-saving transitions.
+- **🩺 PCIe Health Check:** Monitors and warns if the GPU is not running at its maximum supported PCIe generation or link width (e.g., running at x8 instead of x16).
 - **🛡️ Cross-Vendor Support:** Seamlessly works with NVIDIA, AMD, and Intel GPUs.
 - **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes. Summaries are automatically silenced after 2 hours of inactivity to keep your logs clean, and will resume once a qualifying process is detected.
 - **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
@@ -100,6 +102,7 @@ GpuIndex=0
 | `IncludeNearby` | Include "nearby" NUMA nodes based on distance | `true` |
 | `MaxDist` | Max distance from `numactl -H` for "nearby" nodes | `11` |
 | `OnlyGaming` | Only optimize games and high-perf apps | `true` |
+| `MaxPerf` | Force max PCIe performance (disable ASPM/Runtime PM) | `false` |
 | `SkipSystemTune` | Skip modifying `sysctl` or CPU governors | `false` |
 | `DryRun` | Log intended changes without applying them | `false` |
 | `DropPrivs` | Drop root privileges after system tuning | `true` |
@@ -122,6 +125,7 @@ While the configuration file is recommended for persistent settings, you can ove
 - `-s, --strict`: Strict memory policy (sets `StrictMem=true`).
 - `-l, --local-only`: Use only local node (sets `IncludeNearby=false`).
 - `-a, --all-gpu-procs`: Optimize all GPU processes (sets `OnlyGaming=false`).
+- `-f, --max-perf`: Force maximum PCIe performance (sets `MaxPerf=true`).
 - `-x, --no-tune`: Skip system-level kernel tuning (sets `SkipSystemTune=true`).
 - `-n, --dry-run`: Dry-run mode (sets `DryRun=true`).
 - `-m, --max-log-lines`: Set max log lines (sets `MaxAllTimeLogLines`).
@@ -191,8 +195,15 @@ If run as root, the script applies several system-level tweaks to reduce micro-s
 - **`kernel.nmi_watchdog=0`**: Disables the NMI watchdog to reduce periodic interrupts and improve latency consistency.
 - **Transparent Hugepages (THP)**: Set to `never` to prevent micro-stutters and stalls during dynamic allocation and defragmentation.
 - **CPU Scaling Governor**: Automatically sets all cores to `performance` mode to prevent downclocking during gameplay.
+- **PCIe Max Performance**: If enabled, sets the global PCIe ASPM policy to `performance` and disables Runtime Power Management and ASPM for the target GPU.
 
-### 6. Smart Notification Aggregation
+### 6. PCIe Health Monitoring
+When at least one process is optimized, the script periodically verifies the GPU's PCIe connection:
+- **Generation Check**: Compares `current_link_speed` with `max_link_speed` from sysfs.
+- **Width Check**: Compares `current_link_width` with `max_link_width` from sysfs.
+- **Warnings**: If a mismatch is detected (e.g., a PCIe 4.0 card running at 3.0 speeds), a `WARNING` is logged to help the user identify potential hardware or BIOS configuration issues.
+
+### 7. Smart Notification Aggregation
 To prevent notification spam during complex game launches (e.g., Wine/Proton games starting `wineserver`, `explorer.exe`, and the game itself), the script implements a buffering system:
 - **Delayed Delivery**: When a new optimization is detected, the daemon waits `SleepInterval + 5` seconds to catch any subsequent processes.
 - **Amalgamated Messaging**: All processes optimized within that window are grouped into a single notification.
@@ -200,7 +211,7 @@ To prevent notification spam during complex game launches (e.g., Wine/Proton gam
 - **Warning Propagation**: If any single process in a batch fails migration or encounters full nodes, the entire notification is upgraded to a warning icon.
 - **Automatic Summary & Silencing**: In daemon mode, a periodic summary of all active optimizations and total session stats is logged to the system journal every 30 minutes. This process also cleans up any tracked processes that are no longer running. To avoid cluttering logs during long periods of inactivity, these summaries are automatically silenced after 2 hours if no new processes are optimized. They resume immediately once a qualifying process is detected.
 
-### 7. Persistent Tracking & Log Management
+### 8. Persistent Tracking & Log Management
 To provide a long-term view of your system's performance tuning, the script maintains a persistent log file:
 - **`~/.gpu_numa_optimizations`**: A human-readable log file stored in the home directory of the user running the session. Each line records a unique optimization event with a timestamp, PID, process name, status, and target nodes.
 - **Atomic Log Trimming**: To prevent the log from growing indefinitely, it is automatically trimmed when it exceeds the configured limit (default: 10,000 lines). The script uses a 50-line buffer and atomic file operations to ensure log integrity while minimizing disk I/O.

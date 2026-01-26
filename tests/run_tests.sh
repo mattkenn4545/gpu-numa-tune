@@ -271,10 +271,11 @@ SYSCTL_CALLED=false
 taskset() { TASKSET_CALLED=true; }
 numactl() { NUMACTL_CALLED=true; }
 migratepages() { MIGRATEPAGES_CALLED=true; }
-sysctl() { SYSCTL_CALLED=true; }
+# Mock sysctl to just return 0
+sysctl() { return 0; }
 
 # Mocking for system_tune
-EUID=0
+MOCK_EUID=0
 SkipSystemTune=false
 system_tune
 
@@ -541,17 +542,87 @@ assert_eq "2" "$GpuIndexArg" "Config: GpuIndex"
 # Test 14: CLI overrides Config
 echo "Test 14: CLI overrides Config"
 # Previous test left config values set
-parse_args "--physical-only" "--daemon" "--strict" "1"
+parse_args "--physical-only" "--daemon" "--strict" "1" "--max-perf"
 assert_eq "false" "$UseHt" "CLI override: UseHt (already false but still)"
 assert_eq "true" "$DaemonMode" "CLI override: DaemonMode"
 assert_eq "true" "$StrictMem" "CLI override: StrictMem"
 assert_eq "1" "$GpuIndexArg" "CLI override: GpuIndex"
+assert_eq "true" "$MaxPerf" "CLI override: MaxPerf"
 
 # Change some back
 parse_args "-a" "-n"
 assert_eq "false" "$OnlyGaming" "CLI override: OnlyGaming (set to false by -a)"
 
 rm -rf tests/mock_etc
+
+# Test 15: check_pcie_speed
+echo "Test 15: check_pcie_speed"
+mkdir -p "$SYSFS_PREFIX/sys/bus/pci/devices/0000:01:00.0"
+PciAddr="0000:01:00.0"
+echo "16.0 GT/s PCIe" > "$SYSFS_PREFIX/sys/bus/pci/devices/0000:01:00.0/current_link_speed"
+echo "32.0 GT/s PCIe" > "$SYSFS_PREFIX/sys/bus/pci/devices/0000:01:00.0/max_link_speed"
+echo "8" > "$SYSFS_PREFIX/sys/bus/pci/devices/0000:01:00.0/current_link_width"
+echo "16" > "$SYSFS_PREFIX/sys/bus/pci/devices/0000:01:00.0/max_link_width"
+
+LOG_OUTPUT=""
+log() {
+    LOG_OUTPUT+="$1"$'\n'
+}
+
+PcieWarningLogged=false
+check_pcie_speed
+
+echo "$LOG_OUTPUT" | grep -q "WARNING: GPU is not running at max PCIe speed! Current: 16.0 GT/s PCIe, Max: 32.0 GT/s PCIe"
+assert_eq "0" "$?" "check_pcie_speed detects speed mismatch"
+
+echo "$LOG_OUTPUT" | grep -q "WARNING: GPU is not running at max PCIe width! Current: x8, Max: x16"
+assert_eq "0" "$?" "check_pcie_speed detects width mismatch"
+
+# Test matching speed/width
+echo "32.0 GT/s PCIe" > "$SYSFS_PREFIX/sys/bus/pci/devices/0000:01:00.0/current_link_speed"
+echo "16" > "$SYSFS_PREFIX/sys/bus/pci/devices/0000:01:00.0/current_link_width"
+LOG_OUTPUT=""
+PcieWarningLogged=false
+check_pcie_speed
+assert_eq "" "$LOG_OUTPUT" "check_pcie_speed no warning when matching"
+
+# Test 16: system_tune with MaxPerf
+echo "Test 16: system_tune with MaxPerf"
+MOCK_EUID=0
+SkipSystemTune=false
+DryRun=false
+MaxPerf=true
+PciAddr="0000:01:00.0"
+
+# Setup mocks for system_tune
+mkdir -p "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters"
+touch "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy"
+mkdir -p "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power"
+touch "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control"
+mkdir -p "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link"
+touch "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/l1_aspm"
+touch "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/clkpm"
+
+# We need to capture the echoes to check what happened
+# Mock printf to capture its output too
+PRINTF_OUTPUT=""
+printf() {
+    # Actually still print to stdout so we can see it
+    command printf "$@"
+    # And capture it
+    PRINTF_OUTPUT+=$(command printf "$@")
+}
+
+system_tune > /dev/null
+
+echo "$PRINTF_OUTPUT" | grep -q "pcie_aspm_policy"
+assert_eq "0" "$?" "system_tune sets pcie_aspm_policy"
+echo "$PRINTF_OUTPUT" | grep -q "gpu_runtime_pm"
+assert_eq "0" "$?" "system_tune sets gpu_runtime_pm"
+echo "$PRINTF_OUTPUT" | grep -q "gpu_l1_aspm"
+assert_eq "0" "$?" "system_tune sets gpu_l1_aspm"
+echo "$PRINTF_OUTPUT" | grep -q "gpu_clkpm"
+assert_eq "0" "$?" "system_tune sets gpu_clkpm"
 
 echo "--------------------------------------------------------------------------------"
 if [ $FAILED -eq 0 ]; then
