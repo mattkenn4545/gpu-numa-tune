@@ -487,6 +487,27 @@ filter_cpus() {
 
 # --- Process Analysis & Filtering ---
 
+# Extracts a simplified executable name for configuration lookups and notifications.
+# Usage: get_simplified_cmd <pid> <proc_comm> <full_proc_cmd>
+get_simplified_cmd() {
+    local pid="$1"
+    local proc_comm="$2"
+    local full_proc_cmd="$3"
+    local simplified_cmd=""
+
+    if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
+        simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
+    elif [ "$full_proc_cmd" != "[Hidden or Exited]" ] && [ -n "$full_proc_cmd" ]; then
+        simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
+    fi
+
+    # Ensure simplified_cmd is not empty
+    [ -z "$simplified_cmd" ] && simplified_cmd="$proc_comm"
+    [ -z "$simplified_cmd" ] && simplified_cmd="Process $pid"
+
+    echo "$simplified_cmd"
+}
+
 # Determines if a PID should be optimized based on its environment and command line.
 # This function applies several layers of heuristics to identify games:
 # 1. Checks a blacklist of common desktop/system apps (browsers, shells, etc.).
@@ -653,15 +674,7 @@ run_optimization() {
         [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
         # Extract a simplified executable name for configuration lookups and notifications
-        local simplified_cmd=""
-        if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
-            simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
-        elif [ "$full_proc_cmd" != "[Hidden or Exited]" ]; then
-            simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
-        fi
-        # Ensure simplified_cmd is not empty
-        [ -z "$simplified_cmd" ] && simplified_cmd="$proc_comm"
-        [ -z "$simplified_cmd" ] && simplified_cmd="Process $pid"
+        local simplified_cmd=$(get_simplified_cmd "$pid" "$proc_comm" "$full_proc_cmd")
 
         # Load per-process configuration (overrides global settings)
         # We store current globals to restore them after this process
@@ -854,14 +867,7 @@ summarize_optimizations() {
             [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
 
             # Re-extract simplified_cmd for summary
-            local simplified_cmd=""
-            if [[ "$full_proc_cmd" =~ \.[eE][xX][eE] ]]; then
-                simplified_cmd=$(echo "$full_proc_cmd" | sed 's/\.[eE][xX][eE].*/.exe/i' | sed 's/.*[\\\/]//')
-            elif [ "$full_proc_cmd" != "[Hidden or Exited]" ]; then
-                simplified_cmd=$(echo "$full_proc_cmd" | awk '{print $1}' | sed 's/.*[\\\/]//')
-            fi
-            [ -z "$simplified_cmd" ] && simplified_cmd="$proc_comm"
-            [ -z "$simplified_cmd" ] && simplified_cmd="Process $pid"
+            local simplified_cmd=$(get_simplified_cmd "$pid" "$proc_comm" "$full_proc_cmd")
 
             status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$full_proc_cmd"
         done
