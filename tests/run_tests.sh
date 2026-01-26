@@ -413,6 +413,8 @@ output=$(
     PciAddr="0000:01:00.0"
     NumaNodeId=0
     NearbyNodeIds="0"
+    IncludeNearby=true
+    MaxDist=11
     FinalCpuMask="0-7"
     TargetNormalizedMask="0,1,2,3,4,5,6,7"
     OptimizedPidsMap=()
@@ -427,6 +429,26 @@ output=$(
 )
 
 assert_eq "0 procs    | since startup   | 5 all time         | SCANNING                  | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
+
+# Test 11b: Startup summary -l option
+echo "Test 11b: Startup summary -l option"
+output_l=$(
+    PciAddr="0000:01:00.0"
+    NumaNodeId=0
+    NearbyNodeIds="0"
+    IncludeNearby=false
+    MaxDist=11
+    print_banner
+)
+echo "$output_l" | grep -q "NUMA NODE        : 0 (Local Only)"
+assert_eq "0" "$?" "Startup summary with -l shows (Local Only)"
+echo "$output_l" | grep -q "Nearby Max Distance"
+if [ "$?" -eq 0 ]; then
+    echo "[FAIL] Startup summary with -l should NOT show 'Nearby Max Distance'"
+    exit 1
+else
+    echo "[PASS] Startup summary with -l does NOT show 'Nearby Max Distance'"
+fi
 
 # Test 12: All-time log rotation
 echo "Test 12: All-time log rotation (with 50-line buffer)"

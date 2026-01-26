@@ -420,7 +420,7 @@ is_gaming_process() {
     case "$proc_comm" in
         Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) return 1 ;;
         chrome|firefox|brave|msedge|opera|browser|chromium) return 1 ;;
-        steamwebhelper|Discord|slack|teams|obs|obs64|heroic|lutris) return 1 ;;
+        steamwebhelper|Discord|slack|teams|obs|obs64|heroic|lutris|fossilize_repla) return 1 ;;
     esac
 
     # 2. UI/Utility Heuristics
@@ -820,14 +820,14 @@ print_banner() {
     echo "GPU MODEL        :$(lspci -s "$PciAddr" | cut -d: -f3) ($PciAddr)"
 
     if [ "$NumaNodeId" -ge 0 ]; then
-        if [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "-1" ]; then
+        if [ "$IncludeNearby" = true ] && [ -n "$NearbyNodeIds" ] && [ "$NearbyNodeIds" != "-1" ]; then
             echo "NUMA NODES       : $NearbyNodeIds (Nearby Max Distance $MaxDist)"
             IFS=',' read -ra nodes <<< "$NearbyNodeIds"
             for node in "${nodes[@]}"; do
                echo "NODE $node SIZE      : $(get_node_total_mb "$node") MB"
             done
         else
-            echo "NUMA NODE        : $NumaNodeId"
+            echo "NUMA NODE        : $NumaNodeId (Local Only)"
             echo "NUMA NODE SIZE   : $(get_node_total_mb "$NumaNodeId") MB"
         fi
     fi
