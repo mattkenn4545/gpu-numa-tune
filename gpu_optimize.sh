@@ -54,17 +54,19 @@ load_config() {
 # Helper to parse a single configuration file
 parse_config_file() {
     local file="$1"
+    [ -f "$file" ] || return 0
     while IFS='=' read -r key value || [ -n "$key" ]; do
         # Ignore comments and empty lines
         [[ "$key" =~ ^[[:space:]]*#.*$ ]] && continue
         [[ -z "$key" ]] && continue
         
         # Remove leading/trailing whitespace from key and value
-        key=$(echo "$key" | xargs)
-        value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        key=$(echo "$key" | tr -d '[:space:]')
+        value=${value##[[:space:]]}
+        value=${value%%[[:space:]]}
         # Remove trailing comments from value if any
         value=${value%%#*}
-        value=$(echo "$value" | xargs)
+        value=${value%%[[:space:]]}
         
         case "$key" in
             UseHt) UseHt="$value" ;;
@@ -289,8 +291,6 @@ detect_gpu() {
     # Merge both detection methods and deduplicate results.
     mapfile -t all_gpu_pci < <(printf "%s\n" "${active_gpus[@]}" "${vendor_gpus[@]}" | grep -v "^$" | sort -u)
 
-    GpuIndexArg=${GpuIndexArg:-0}
-
     if [ "${#all_gpu_pci[@]}" -eq 0 ]; then
         # Last resort: Any device reported by lspci as VGA or 3D.
         mapfile -t all_gpu_pci < <(lspci -D | grep -iE 'vga|3d' | awk '{print $1}')
@@ -338,7 +338,7 @@ discover_resources() {
         RawCpuList=$(get_nodes_cpulist "$NearbyNodeIds")
     fi
 
-    if [ -z "$RawCpuList" ]; then
+    if [ -z "$RawCpuList" ] || [ "$RawCpuList" == " " ]; then
         echo "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
         RawCpuList=$(cat "$SYSFS_PREFIX/sys/devices/system/cpu/online" 2>/dev/null)
     fi
@@ -542,7 +542,7 @@ is_gaming_process() {
     fi
 
     # 4. Binary Name Heuristics
-    if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer|UnrealEditor"; then
+    if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer|UnrealEditor|Solaris|GZDoom"; then
         return 0
     fi
 
@@ -574,10 +574,14 @@ system_tune() {
             local value="$2"
             local label="$3"
             # Check if the sysctl key exists before attempting to set it
-            if [ -f "/proc/sys/${key//./ /}" ] || sysctl "$key" >/dev/null 2>&1; then
+            local sys_path="/proc/sys/${key//./\/}"
+            if [ -f "$sys_path" ] || sysctl "$key" >/dev/null 2>&1; then
                 if [ "$DryRun" = false ]; then
-                    sysctl -w "$key=$value" >/dev/null
-                    printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$value" "$label"
+                    if sysctl -w "$key=$value" >/dev/null 2>&1; then
+                        printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$value" "$label"
+                    else
+                        printf "  [FAIL] %-28s -> %-10s (%s)\n" "$key" "$value" "$label"
+                    fi
                 else
                     printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$value" "$label"
                 fi
@@ -689,11 +693,13 @@ run_optimization() {
         local l_FinalCpuMask="$FinalCpuMask"
         local l_TargetNormalizedMask="$TargetNormalizedMask"
         local l_NearbyNodeIds="$NearbyNodeIds"
+        local l_NumaNodeId="$NumaNodeId"
+        local l_StrictMem="$StrictMem"
 
         if [ "$UseHt" != "$old_UseHt" ] || [ "$IncludeNearby" != "$old_IncludeNearby" ] || [ "$MaxDist" != "$old_MaxDist" ]; then
             # Backup current global RawCpuList and other state used by filter_cpus/discover_resources
             local old_RawCpuList="$RawCpuList"
-            local old_NumaNodeId="$NumaNodeId"
+            local old_NumaNodeId_global="$NumaNodeId"
 
             discover_resources "$IncludeNearby" "$MaxDist"
             filter_cpus "$UseHt"
@@ -701,10 +707,11 @@ run_optimization() {
             l_FinalCpuMask="$FinalCpuMask"
             l_TargetNormalizedMask="$TargetNormalizedMask"
             l_NearbyNodeIds="$NearbyNodeIds"
+            l_NumaNodeId="$NumaNodeId"
 
             # Restore globals for next processes (unless they have their own config)
             RawCpuList="$old_RawCpuList"
-            NumaNodeId="$old_NumaNodeId"
+            NumaNodeId="$old_NumaNodeId_global"
         fi
 
         local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
@@ -719,8 +726,8 @@ run_optimization() {
             if [ "$DryRun" = false ]; then
                 taskset -pc "$l_FinalCpuMask" "$pid" > /dev/null 2>&1
 
-                if [ "$StrictMem" = true ]; then
-                    numactl --membind="${l_NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
+                if [ "$l_StrictMem" = true ]; then
+                    numactl --membind="${l_NearbyNodeIds:-$l_NumaNodeId}" -p "$pid" > /dev/null 2>&1
                 else
                     # Preferred policy: try multiple nodes if available, fallback to single
                     if [[ "$l_NearbyNodeIds" == *","* ]]; then
@@ -728,7 +735,7 @@ run_optimization() {
                              numactl --preferred="${l_NearbyNodeIds%%,*}" -p "$pid" > /dev/null 2>&1
                         fi
                     else
-                        numactl --preferred="${l_NearbyNodeIds:-$NumaNodeId}" -p "$pid" > /dev/null 2>&1
+                        numactl --preferred="${l_NearbyNodeIds:-$l_NumaNodeId}" -p "$pid" > /dev/null 2>&1
                     fi
                 fi
             fi
@@ -743,14 +750,14 @@ run_optimization() {
                 for node in "${nodes[@]}"; do
                     free_kb=$((free_kb + $(get_node_free_kb "$node")))
                 done
-            elif [ "$NumaNodeId" -ge 0 ]; then
-                free_kb=$(get_node_free_kb "$NumaNodeId")
+            elif [ "$l_NumaNodeId" -ge 0 ]; then
+                free_kb=$(get_node_free_kb "$l_NumaNodeId")
             else
                 free_kb=0
             fi
 
             # Migrate pages if there's enough free memory (with a safety margin).
-            local target_nodes="${l_NearbyNodeIds:-$NumaNodeId}"
+            local target_nodes="${l_NearbyNodeIds:-$l_NumaNodeId}"
             if [[ "$target_nodes" != "-1" ]] && [ "$free_kb" -gt $((process_rss_kb + safety_margin_kb)) ]; then
                 if [ "$DryRun" = false ]; then
                     if migratepages "$pid" all "$target_nodes" > /dev/null 2>&1; then
@@ -925,10 +932,24 @@ parse_args() {
             -x|--no-tune) SkipSystemTune=true; shift ;;
             -n|--dry-run) DryRun=true; shift ;;
             -k|--no-drop) DropPrivs=false; shift ;;
-            -m|--max-log-lines) MaxAllTimeLogLines=$2; shift 2 ;;
+            -m|--max-log-lines) 
+                if [[ "$2" =~ ^[0-9]+$ ]]; then
+                    MaxAllTimeLogLines=$2; shift 2
+                else
+                    echo "Error: --max-log-lines requires a numeric argument." >&2
+                    exit 1
+                fi
+                ;;
             -h|--help) usage ;;
             -*) echo "Unknown option: $1" ; usage ;;
-            *) GpuIndexArg=$1; shift ;;
+            *) 
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    GpuIndexArg=$1; shift
+                else
+                    echo "Error: GPU index must be a numeric value: $1" >&2
+                    exit 1
+                fi
+                ;;
         esac
     done
 }
