@@ -73,8 +73,7 @@ You can also create process-specific configuration files. The optimizer looks fo
 
 1.  `/etc/gpu-numa-tune/`
 2.  `~/.config/gpu-numa-tune/`
-3.  The same directory as the game's executable.
-4.  The current working directory of the script.
+3.  The current working directory of the script.
 
 These per-process configs can override settings like `UseHt`, `IncludeNearby`, `MaxDist`, and `StrictMem` for that specific game without affecting global behavior.
 
@@ -119,7 +118,7 @@ While the configuration file is recommended for persistent settings, you can ove
 **Usage:**
 `sudo ./gpu_optimize.sh [options] [gpu_index]`
 
-**Common Options:**
+** Options:**
 - `-p, --physical-only`: Skip SMT/Hyper-threading siblings (sets `UseHt=false`).
 - `-d, --daemon`: Run in daemon mode (sets `DaemonMode=true`).
 - `-s, --strict`: Strict memory policy (sets `StrictMem=true`).
@@ -216,6 +215,14 @@ To provide a long-term view of your system's performance tuning, the script main
 - **`~/.gpu_numa_optimizations`**: A human-readable log file stored in the home directory of the user running the session. Each line records a unique optimization event with a timestamp, PID, process name, status, and target nodes.
 - **Atomic Log Trimming**: To prevent the log from growing indefinitely, it is automatically trimmed when it exceeds the configured limit (default: 10,000 lines). The script uses a 50-line buffer and atomic file operations to ensure log integrity while minimizing disk I/O.
 - **Global Stats**: The periodic status summary includes an "all-time" counter derived from this log, giving you a quick glance at how many processes have been optimized across all sessions.
+
+### 9. Automatic System Tuning & Persistence
+GPU NUMA Optimizer manages system-level kernel parameters dynamically to ensure high performance when needed and system stability when idle.
+
+- **On-Demand Activation**: System-level optimizations (like `kernel.numa_balancing=0` and CPU governor changes) are applied the moment the first qualifying process is identified for optimization.
+- **Original Value Persistence**: When the script first tunes a system setting, it reads the current kernel value and appends it to `/etc/gpu-numa-tune.conf`. This ensures that the original system state is "remembered" across reboots and service restarts.
+- **Automatic Restoration**: When the last optimized process exits, or when the `gpu-numa-optimizer` service is stopped, the script automatically reverts all modified kernel parameters to their original values stored in the configuration file.
+- **Manual Override**: If you wish to skip system-level tuning entirely, use the `--no-tune` flag or set `SkipSystemTune=true` in your configuration.
 
 ---
 
