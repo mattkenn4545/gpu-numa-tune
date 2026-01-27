@@ -337,14 +337,14 @@ getent() {
         echo "testuser:x:1000:1000::$(pwd)/tests/mock_home:/bin/bash"
     fi
 }
-mkdir -p tests/mock_home
-echo "entry1" > tests/mock_home/.gpu_numa_optimizations
-echo "entry2" >> tests/mock_home/.gpu_numa_optimizations
+mkdir -p tests/mock_home/.config/gpu-numa-tune/
+echo "entry1" > tests/mock_home/.config/gpu-numa-tune/optimizations.log
+echo "entry2" >> tests/mock_home/.config/gpu-numa-tune/optimizations.log
 TargetUser="testuser"
 
 load_all_time_stats
 assert_eq "2" "$LifetimeOptimizedCount" "load_all_time_stats loads correct line count"
-assert_eq "$(pwd)/tests/mock_home/.gpu_numa_optimizations" "$AllTimeFile" "AllTimeFile path set correctly"
+assert_eq "$(pwd)/tests/mock_home/.config/gpu-numa-tune/optimizations.log" "$AllTimeFile" "AllTimeFile path set correctly"
 
 # Simulate optimizing a process (ACTUAL optimization)
 pid=1234
