@@ -50,53 +50,55 @@ if [ ! -f "$INSTALL_CONFIG_PATH" ]; then
 # GPU NUMA Optimizer Configuration
 
 # Use SMT/HT sibling cores (true/false)
-UseHt=true
+#UseHt=true
 
 # Run in daemon mode (true/false)
-DaemonMode=false
+#DaemonMode=false
 
 # Seconds to wait between process checks in daemon mode
-SleepInterval=10
+#SleepInterval=10
 
 # Strict memory policy (true/false)
 # true = use 'membind' (fails if node full), false = use 'preferred'
-StrictMem=false
+#StrictMem=false
 
 # Include "nearby" NUMA nodes in addition to the closest one (true/false)
-IncludeNearby=true
+#IncludeNearby=true
 
 # Maximum distance value from 'numactl -H' to consider a node "nearby"
-MaxDist=11
+#MaxDist=11
 
 # Only optimize processes identified as games or high-perf apps (true/false)
-OnlyGaming=true
+#OnlyGaming=true
 
 # Skip system-level tuning (sysctl, etc.) (true/false)
-SkipSystemTune=false
+#SkipSystemTune=false
 
 # Force max PCIe performance (disable ASPM/Runtime PM) (true/false)
-MaxPerf=false
+#MaxPerf=false
 
 # Dry-run mode (true/false)
-DryRun=false
+#DryRun=false
 
 # Drop from root to the logged-in user after system tuning (true/false)
-DropPrivs=true
+#DropPrivs=true
 
 # Maximum number of lines to keep in the all-time optimization log
-MaxAllTimeLogLines=10000
+#MaxAllTimeLogLines=10000
 
 # Default GPU index to optimize
-GpuIndex=0
+#GpuIndex=0
 
 # Interval between periodic summary reports (seconds)
-SummaryInterval=1800
+#SummaryInterval=1800
 
 # Stop summary messages after inactivity (seconds)
-SummarySilenceTimeout=7200
+#SummarySilenceTimeout=7200
 
 # Number of log lines before repeating the table header
-HeaderInterval=20
+#HeaderInterval=20
+
+# SystemTune Original values
 EOF
 else
     echo "Configuration file $INSTALL_CONFIG_PATH already exists. Skipping..."
