@@ -915,7 +915,7 @@ run_optimization() {
             local l_NumaNodeId="$NumaNodeId"
             local l_StrictMem="$StrictMem"
 
-            if [ "$UseHt" != "$old_UseHt" ] || [ "$IncludeNearby" != "$old_IncludeNearby" ] || [ "$MaxDist" != "$old_MaxDist" ]; then
+            if [ "$UseHt" != "$GlobalUseHt" ] || [ "$IncludeNearby" != "$GlobalIncludeNearby" ] || [ "$MaxDist" != "$GlobalMaxDist" ]; then
                 discover_resources "$IncludeNearby" "$MaxDist"
                 filter_cpus "$UseHt"
                 l_FinalCpuMask="$FinalCpuMask"
@@ -924,7 +924,7 @@ run_optimization() {
                 l_NumaNodeId="$NumaNodeId"
             fi
             
-            local overrides=$(get_overrides "$old_UseHt" "$old_IncludeNearby" "$old_MaxDist" "$old_StrictMem")
+            local overrides=$(get_overrides "$GlobalUseHt" "$GlobalIncludeNearby" "$GlobalMaxDist" "$GlobalStrictMem")
             echo "$l_FinalCpuMask|$l_TargetNormalizedMask|$l_NearbyNodeIds|$l_NumaNodeId|$l_StrictMem|$overrides"
         )
 
@@ -1091,7 +1091,7 @@ summarize_optimizations() {
             # Load per-process configuration to find overrides for summary
             local overrides=$(
                 load_process_config "$simplified_cmd"
-                get_overrides "$old_UseHt" "$old_IncludeNearby" "$old_MaxDist" "$old_StrictMem"
+                get_overrides "$GlobalUseHt" "$GlobalIncludeNearby" "$GlobalMaxDist" "$GlobalStrictMem"
             )
 
             status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$overrides"
@@ -1304,6 +1304,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     discover_resources
     filter_cpus
     load_all_time_stats
+
+    # Capture global configuration baseline for override detection
+    GlobalUseHt="$UseHt"
+    GlobalIncludeNearby="$IncludeNearby"
+    GlobalMaxDist="$MaxDist"
+    GlobalStrictMem="$StrictMem"
 
     # Setup signal handlers for cleanup
     trap 'trigger_system_management "restore"; exit 0' TERM INT QUIT
