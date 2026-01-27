@@ -80,11 +80,12 @@ assert_eq "true" "$DaemonMode" "parse_args --daemon"
 assert_eq "true" "$StrictMem" "parse_args --strict"
 assert_eq "1" "$GpuIndexArg" "parse_args GpuIndexArg"
 
-parse_args "-l" "-a" "-x" "-k" "--comm-pipe" "/tmp/pipe"
+parse_args "-l" "-a" "-x" "-k" "-c" "--comm-pipe" "/tmp/pipe"
 assert_eq "false" "$IncludeNearby" "parse_args --local-only"
 assert_eq "false" "$OnlyGaming" "parse_args --all-gpu-procs"
 assert_eq "true" "$SkipSystemTune" "parse_args --no-tune"
 assert_eq "false" "$DropPrivs" "parse_args --no-drop"
+assert_eq "false" "$AutoGenConfig" "parse_args --no-config"
 assert_eq "/tmp/pipe" "$CommPipe" "parse_args --comm-pipe"
 
 # Test 3: is_gaming_process (mocking ps and /proc)
@@ -493,6 +494,7 @@ OnlyGaming=false
 SkipSystemTune=true
 DryRun=true
 DropPrivs=false
+AutoGenConfig=false
 MaxAllTimeLogLines=5000
 GpuIndex=2
 EOF
@@ -523,6 +525,7 @@ load_config() {
                     DryRun) DryRun="$value" ;;
                     DropPrivs) DropPrivs="$value" ;;
                     MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
+                    AutoGenConfig) AutoGenConfig="$value" ;;
                     GpuIndex) GpuIndexArg="$value" ;;
                 esac
             done < "$file"
@@ -542,6 +545,7 @@ assert_eq "true" "$SkipSystemTune" "Config: SkipSystemTune"
 assert_eq "true" "$DryRun" "Config: DryRun"
 assert_eq "false" "$DropPrivs" "Config: DropPrivs"
 assert_eq "5000" "$MaxAllTimeLogLines" "Config: MaxAllTimeLogLines"
+assert_eq "false" "$AutoGenConfig" "Config: AutoGenConfig"
 assert_eq "2" "$GpuIndexArg" "Config: GpuIndex"
 
 # Test 14: CLI overrides Config

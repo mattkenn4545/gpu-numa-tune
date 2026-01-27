@@ -36,6 +36,7 @@ SkipSystemTune=false         # If true, do not attempt to modify sysctl or CPU g
 MaxPerf=false                # If true, force PCIe device and ASPM to maximum performance
 DryRun=false                 # If true, log intended changes but do not apply them
 DropPrivs=true               # If true, drop from root to the logged-in user after system tuning
+AutoGenConfig=true           # If true, create per-command default configuration files
 MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time optimization log
 GpuIndexArg=0                # Default GPU index
 SystemConfig="/etc/gpu-numa-tune.conf"
@@ -82,6 +83,7 @@ parse_config_file() {
             MaxPerf) MaxPerf="$value" ;;
             DryRun) DryRun="$value" ;;
             DropPrivs) DropPrivs="$value" ;;
+            AutoGenConfig) AutoGenConfig="$value" ;;
             MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
             GpuIndex) GpuIndexArg="$value" ;;
             SummaryInterval) SummaryInterval="$value" ;;
@@ -116,6 +118,46 @@ load_process_config() {
             parse_config_file "$file"
         fi
     done
+}
+
+# Creates a default configuration file for a process if it doesn't exist
+create_process_config() {
+    local simplified_cmd="$1"
+    local config_name="${simplified_cmd}.conf"
+    local config_dir=""
+    local config_path=""
+
+    if [ -n "$TargetUser" ]; then
+        local target_home=$(getent passwd "$TargetUser" | cut -d: -f6)
+        [ -n "$target_home" ] && config_dir="${target_home}/.config/gpu-numa-tune"
+    else
+        config_dir="$HOME/.config/gpu-numa-tune"
+    fi
+    config_path="${config_dir}/${config_name}"
+
+    local existing_config=""
+    if [ -f "$config_path" ]; then
+        existing_config="$config_path"
+    fi
+
+    if [ -z "$existing_config" ]; then
+        if [ "$DryRun" = false ]; then
+            mkdir -p "$config_dir" 2>/dev/null
+            cat > "$config_path" <<EOF
+UseHt=${GlobalUseHt:-$UseHt}
+IncludeNearby=${GlobalIncludeNearby:-$IncludeNearby}
+MaxDist=${GlobalMaxDist:-$MaxDist}
+StrictMem=${GlobalStrictMem:-$StrictMem}
+EOF
+            # If we're root but target user exists, ensure they own the file
+            if [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
+                chown -R "$TargetUser:$TargetGid" "$config_dir" 2>/dev/null
+            fi
+            log "Created default config for $simplified_cmd at $config_path"
+        else
+            log "Dry run: Would create default config for $simplified_cmd at $config_path"
+        fi
+    fi
 }
 
 # State Tracking
@@ -196,6 +238,7 @@ usage() {
     echo "  -x, --no-tune        Skip system-level tuning (sysctl, etc.)"
     echo "  -f, --max-perf       Force max PCIe performance (disable ASPM/Runtime PM)"
     echo "  -n, --dry-run        Dry-run mode (don't apply any changes)"
+    echo "  -c, --no-config      Do not automatically create per-command local configs"
     echo "  -k, --no-drop        Keep root privileges (do not drop to user)"
     echo "  --comm-pipe <path>   Use a specific path for the communication pipe"
     echo "  -m, --max-log-lines  Maximum all-time log lines (default: $MaxAllTimeLogLines)"
@@ -1003,6 +1046,9 @@ run_optimization() {
                 ((LifetimeOptimizedCount++))
                 LastOptimizationTime=$(date +%s)
                 SummarySilenced=false
+                if [ "$AutoGenConfig" = true ]; then
+                    create_process_config "$simplified_cmd"
+                fi
                 if [ "$DryRun" = false ] && [ -n "$AllTimeFile" ]; then
                     # Log entry format: TIMESTAMP | PID | COMM | CMD | STATUS | NODES
                     printf "%-19s | %-8s | %-16s | %-20s | %-22s | %-8s\n" \
@@ -1150,6 +1196,7 @@ parse_args() {
             -x|--no-tune) SkipSystemTune=true; shift ;;
             -f|--max-perf) MaxPerf=true; shift ;;
             -n|--dry-run) DryRun=true; shift ;;
+            -c|--no-config) AutoGenConfig=false; shift ;;
             -k|--no-drop) DropPrivs=false; shift ;;
             --comm-pipe) CommPipe=$2; shift 2 ;;
             -m|--max-log-lines) 
@@ -1213,6 +1260,7 @@ print_banner() {
     echo "CPU TARGETS      : $( [ "$UseHt" = true ] && echo "HT Allowed" || echo "Physical Only" ) ($FinalCpuMask)"
     echo "MEM POLICY       : $mem_policy_label"
     echo "PROCESS FILTER   : $( [ "$OnlyGaming" = true ] && echo "Gaming Only" || echo "All GPU Processes" )"
+    echo "AUTOGEN CONFIG   : $( [ "$AutoGenConfig" = true ] && echo "Enabled" || echo "Disabled" )"
     echo "PCIe PERF        : $( [ "$MaxPerf" = true ] && echo "Max (ASPM Disabled)" || echo "Default" )"
     echo "DRY RUN MODE     : $( [ "$DryRun" = true ] && echo "ENABLED (No changes will be applied)" || echo "Disabled" )"
     echo "MODE             : $( [ "$DaemonMode" = true ] && echo "Daemon" || echo "Single-run" )"

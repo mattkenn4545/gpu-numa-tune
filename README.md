@@ -105,6 +105,7 @@ GpuIndex=0
 | `SkipSystemTune` | Skip modifying `sysctl` or CPU governors | `false` |
 | `DryRun` | Log intended changes without applying them | `false` |
 | `DropPrivs` | Drop root privileges after system tuning | `true` |
+| `AutoGenConfig` | Create per-command default configuration files | `true` |
 | `MaxAllTimeLogLines` | Max lines to keep in `~/.gpu_numa_optimizations` | `10000` |
 | `GpuIndex` | Default GPU index to target | `0` |
 | `SummaryInterval` | Interval between periodic summary reports (seconds) | `1800` |
