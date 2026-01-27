@@ -281,6 +281,7 @@ sysctl() { return 0; }
 # Mocking for system_tune
 MOCK_EUID=0
 SkipSystemTune=false
+SystemTuned="" # Reset SystemTuned to allow printing/tuning
 system_manage_settings "tune"
 
 assert_eq "false" "$SYSCTL_CALLED" "Dry-run: sysctl not called"
@@ -617,6 +618,9 @@ printf() {
     PRINTF_OUTPUT+=$(command printf "$@")
 }
 
+MaxPerf=true
+SystemTuned=""
+PRINTF_OUTPUT=""
 system_manage_settings "tune" > /dev/null
 
 echo "$PRINTF_OUTPUT" | grep -q "pcie_aspm_policy"

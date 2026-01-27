@@ -666,8 +666,6 @@ system_manage_settings() {
             [ "$SystemTuned" = true ] && echo "Warning: Restoration config $SystemConfig missing."
             return 1
         }
-        sleep "$SleepInterval" &
-        wait $!
     else
         [ "$SystemTuned" == "" ] && echo "--> Root detected. Applying system-wide optimizations..."
     fi
@@ -783,8 +781,6 @@ system_manage_settings() {
                 fi
             fi
         done
-
-        [ "$SystemTuned" == "" ] && SystemTuned=false
     fi
 
     # Transparent Hugepages (THP)
@@ -843,7 +839,11 @@ system_manage_settings() {
         fi
         [ "$SystemTuned" == "" ] && echo "--> System tuning complete."
         [ "$SystemTuned" == "" ] && echo "------------------------------------------------------------------------------------------------"
+      SystemTuned=true
+    else
+      SystemTuned=false
     fi
+
     return 0
 }
 
@@ -904,46 +904,34 @@ run_optimization() {
         local simplified_cmd=$(get_simplified_cmd "$pid" "$proc_comm" "$full_proc_cmd")
 
         # Load per-process configuration (overrides global settings)
-        # We store current globals to restore them after this process
-        local old_UseHt="$UseHt"
-        local old_IncludeNearby="$IncludeNearby"
-        local old_MaxDist="$MaxDist"
-        local old_StrictMem="$StrictMem"
-        
-        load_process_config "$simplified_cmd"
-        
-        # Calculate overrides for display
-        local overrides=$(get_overrides "$old_UseHt" "$old_IncludeNearby" "$old_MaxDist" "$old_StrictMem")
+        # Using a subshell to calculate process-specific settings without polluting globals
+        local proc_settings=$(
+            # Subshell starts here
+            load_process_config "$simplified_cmd"
+            
+            local l_FinalCpuMask="$FinalCpuMask"
+            local l_TargetNormalizedMask="$TargetNormalizedMask"
+            local l_NearbyNodeIds="$NearbyNodeIds"
+            local l_NumaNodeId="$NumaNodeId"
+            local l_StrictMem="$StrictMem"
 
-        # Recalculate masks if settings changed for this process
-        local l_FinalCpuMask="$FinalCpuMask"
-        local l_TargetNormalizedMask="$TargetNormalizedMask"
-        local l_NearbyNodeIds="$NearbyNodeIds"
-        local l_NumaNodeId="$NumaNodeId"
-        local l_StrictMem="$StrictMem"
+            if [ "$UseHt" != "$old_UseHt" ] || [ "$IncludeNearby" != "$old_IncludeNearby" ] || [ "$MaxDist" != "$old_MaxDist" ]; then
+                discover_resources "$IncludeNearby" "$MaxDist"
+                filter_cpus "$UseHt"
+                l_FinalCpuMask="$FinalCpuMask"
+                l_TargetNormalizedMask="$TargetNormalizedMask"
+                l_NearbyNodeIds="$NearbyNodeIds"
+                l_NumaNodeId="$NumaNodeId"
+            fi
+            
+            local overrides=$(get_overrides "$old_UseHt" "$old_IncludeNearby" "$old_MaxDist" "$old_StrictMem")
+            echo "$l_FinalCpuMask|$l_TargetNormalizedMask|$l_NearbyNodeIds|$l_NumaNodeId|$l_StrictMem|$overrides"
+        )
 
-        if [ "$UseHt" != "$old_UseHt" ] || [ "$IncludeNearby" != "$old_IncludeNearby" ] || [ "$MaxDist" != "$old_MaxDist" ]; then
-            # Backup current global RawCpuList and other state used by filter_cpus/discover_resources
-            local old_RawCpuList="$RawCpuList"
-            local old_NumaNodeId_global="$NumaNodeId"
-
-            discover_resources "$IncludeNearby" "$MaxDist"
-            filter_cpus "$UseHt"
-
-            l_FinalCpuMask="$FinalCpuMask"
-            l_TargetNormalizedMask="$TargetNormalizedMask"
-            l_NearbyNodeIds="$NearbyNodeIds"
-            l_NumaNodeId="$NumaNodeId"
-
-            # Restore globals for next processes (unless they have their own config)
-            RawCpuList="$old_RawCpuList"
-            NumaNodeId="$old_NumaNodeId_global"
-        fi
+        IFS='|' read -r l_FinalCpuMask l_TargetNormalizedMask l_NearbyNodeIds l_NumaNodeId l_StrictMem overrides <<< "$proc_settings"
 
         local raw_current_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
         if [ -z "$raw_current_affinity" ]; then
-             # Restore globals before continue
-             UseHt="$old_UseHt"; IncludeNearby="$old_IncludeNearby"; MaxDist="$old_MaxDist"; StrictMem="$old_StrictMem"
              continue
         fi
         local current_normalized_mask=$(normalize_affinity "$raw_current_affinity")
@@ -976,7 +964,7 @@ run_optimization() {
                 for node in "${nodes[@]}"; do
                     free_kb=$((free_kb + $(get_node_free_kb "$node")))
                 done
-            elif [ "$l_NumaNodeId" -ge 0 ]; then
+            elif [[ "$l_NumaNodeId" =~ ^[0-9]+$ ]] && [ "$l_NumaNodeId" -ge 0 ]; then
                 free_kb=$(get_node_free_kb "$l_NumaNodeId")
             else
                 free_kb=0
@@ -1035,10 +1023,6 @@ run_optimization() {
         fi
 
         # Restore globals for next process in the loop
-        UseHt="$old_UseHt"
-        IncludeNearby="$old_IncludeNearby"
-        MaxDist="$old_MaxDist"
-        StrictMem="$old_StrictMem"
     done
 }
 
@@ -1105,19 +1089,12 @@ summarize_optimizations() {
             local simplified_cmd=$(get_simplified_cmd "$pid" "$proc_comm" "$full_proc_cmd")
 
             # Load per-process configuration to find overrides for summary
-            local old_UseHt="$UseHt"
-            local old_IncludeNearby="$IncludeNearby"
-            local old_MaxDist="$MaxDist"
-            local old_StrictMem="$StrictMem"
-            
-            load_process_config "$simplified_cmd"
-            
-            local overrides=$(get_overrides "$old_UseHt" "$old_IncludeNearby" "$old_MaxDist" "$old_StrictMem")
+            local overrides=$(
+                load_process_config "$simplified_cmd"
+                get_overrides "$old_UseHt" "$old_IncludeNearby" "$old_MaxDist" "$old_StrictMem"
+            )
 
             status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$overrides"
-
-            # Restore globals
-            UseHt="$old_UseHt"; IncludeNearby="$old_IncludeNearby"; MaxDist="$old_MaxDist"; StrictMem="$old_StrictMem"
         done
 
         LastSummaryTime=$now
@@ -1347,8 +1324,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             # (e.g., a game launcher starting the game engine) to appear.
             if [ ${#PendingOptimizations[@]} -gt 0 ]; then
                 log "Optimized ${#PendingOptimizations[@]} process(es). Waiting ${SleepInterval}s to aggregate more..."
-                sleep "$SleepInterval" &
-                wait $!
                 # Run one more time to catch immediate followers
                 run_optimization
                 flush_notifications
