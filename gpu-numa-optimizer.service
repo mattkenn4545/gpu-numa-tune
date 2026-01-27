@@ -1,6 +1,7 @@
 [Unit]
 Description=GPU NUMA Node Affinity Optimizer
 After=network.target graphical.target
+Documentation=https://github.com/mattkenn4545/gpu-numa-tune
 
 [Service]
 Type=simple
@@ -13,6 +14,15 @@ ExecStart=/usr/local/bin/gpu_optimize.sh -d
 Restart=always
 RestartSec=10
 User=root
+
+# Ensure the root management process has time to restore system settings on stop.
+# SIGTERM is sent to all processes in the control group.
+KillMode=control-group
+TimeoutStopSec=30
+
+# Logging to journald
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

@@ -38,11 +38,12 @@ DryRun=false                 # If true, log intended changes but do not apply th
 DropPrivs=true               # If true, drop from root to the logged-in user after system tuning
 MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time optimization log
 GpuIndexArg=0                # Default GPU index
+SystemConfig="/etc/gpu-numa-tune.conf"
 
 # Load configuration from files
 load_config() {
     local config_files=(
-        "/etc/gpu-numa-tune.conf"
+        "$SystemConfig"
         "$HOME/.config/gpu-numa-tune.conf"
         "$(pwd)/gpu-numa-tune.conf"
     )
@@ -118,6 +119,7 @@ load_process_config() {
 }
 
 # State Tracking
+SystemTuned=""               # Tracks if system optimizations are currently applied (true/false/empty)
 declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
 TotalOptimizedCount=0        # Total number of unique processes optimized since script start
 LastOptimizedCount=-1        # Number of optimized processes in the last check
@@ -195,6 +197,7 @@ usage() {
     echo "  -f, --max-perf       Force max PCIe performance (disable ASPM/Runtime PM)"
     echo "  -n, --dry-run        Dry-run mode (don't apply any changes)"
     echo "  -k, --no-drop        Keep root privileges (do not drop to user)"
+    echo "  --comm-pipe <path>   Use a specific path for the communication pipe"
     echo "  -m, --max-log-lines  Maximum all-time log lines (default: $MaxAllTimeLogLines)"
     echo "  -h, --help           Show this help message"
     echo
@@ -609,138 +612,269 @@ is_gaming_process() {
 
 # --- System Optimization & Tuning ---
 
-# Applies system-wide low-latency and NUMA-related optimizations (requires root)
-system_tune() {
-    [ "$SkipSystemTune" = true ] && return
+# Persists original value of a system setting to the config file if not already present.
+# This creates a "first encounter" record of the system state.
+persist_original_value() {
+    local key="$1"
+    local value="$2"
+    
+    [ -z "$SystemConfig" ] && return
+    [ ! -w "$(dirname "$SystemConfig")" ] && return
+    
+    # Extract the active value enclosed in brackets if present (e.g., for THP)
+    if [[ "$value" =~ \[([^\]]+)\] ]]; then
+        value="${BASH_REMATCH[1]}"
+    fi
+    
+    # Check if key already exists in the config file
+    if [ -f "$SystemConfig" ] && grep -qE "^[[:space:]]*${key}=" "$SystemConfig"; then
+        return
+    fi
+    
+    # Append the key=value pair to the config file
+    if [ "$DryRun" = false ]; then
+        # Ensure there is a newline if file is not empty and doesn't end with one
+        if [ -s "$SystemConfig" ] && [ -n "$(tail -c 1 "$SystemConfig" 2>/dev/null)" ]; then
+            echo "" >> "$SystemConfig"
+        fi
+        echo "${key}=${value}" >> "$SystemConfig"
+    else
+        printf "  [DRY] Persist %-24s = %-10s (Original Value)\n" "$key" "$value"
+    fi
+}
+
+# Applies or reverts system-wide low-latency and NUMA-related optimizations (requires root)
+system_manage_settings() {
+    local action="$1" # "tune" or "restore"
+    [ "$SkipSystemTune" = true ] && return 0
 
     # Determine effective EUID (allowing for mocking in tests)
     local eff_euid="${MOCK_EUID:-$EUID}"
+    if [ "$eff_euid" -ne 0 ]; then
+        if [ "$SystemTuned" == "" ]; then
+            echo "------------------------------------------------------------------------------------------------"
+            echo "WARNING: Not running as root. Latency tuning skipped."
+            echo "------------------------------------------------------------------------------------------------"
+        fi
+        return 1
+    fi
 
-    if [ "$eff_euid" -eq 0 ]; then
-        echo "--> Root detected. Applying system-wide optimizations..."
+    if [ "$action" = "restore" ]; then
+        # Reload config to ensure we have the latest original values
+        [ -f "$SystemConfig" ] && parse_config_file "$SystemConfig"
+        [ ! -f "$SystemConfig" ] && {
+            [ "$SystemTuned" = true ] && echo "Warning: Restoration config $SystemConfig missing."
+            return 1
+        }
+        sleep "$SleepInterval" &
+        wait $!
+    else
+        [ "$SystemTuned" == "" ] && echo "--> Root detected. Applying system-wide optimizations..."
+    fi
 
-        set_sysctl() {
-            local key="$1"
-            local value="$2"
-            local label="$3"
-            # Check if the sysctl key exists before attempting to set it
+    # Helper to get the target value for a setting
+    get_target_val() {
+        local key="$1"
+        local tune_val="$2"
+
+        if [ "$action" = "tune" ]; then
+            echo "$tune_val"
+        else
+            # action = restore
+            grep "^${key}=" "$SystemConfig" 2>/dev/null | cut -d= -f2
+        fi
+    }
+
+    # Helper for sysctl settings
+    manage_sysctl() {
+        local key="$1"
+        local tune_val="$2"
+        local label="$3"
+
+        local target_val=$(get_target_val "$key" "$tune_val")
+        [ -z "$target_val" ] && return 0
+
+        if [ "$action" = "tune" ]; then
             local sys_path="$PROC_PREFIX/proc/sys/${key//./\/}"
             if [ -f "$sys_path" ] || sysctl "$key" >/dev/null 2>&1; then
-                if [ "$DryRun" = false ]; then
-                    SYSCTL_CALLED=true
-                    if sysctl -w "$key=$value" >/dev/null 2>&1; then
-                        printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$value" "$label"
-                    else
-                        printf "  [FAIL] %-28s -> %-10s (%s)\n" "$key" "$value" "$label"
-                    fi
+                local current_val
+                if [ -f "$sys_path" ]; then
+                    current_val=$(cat "$sys_path")
                 else
-                    printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$value" "$label"
+                    current_val=$(sysctl -n "$key" 2>/dev/null)
                 fi
+                persist_original_value "$key" "$current_val"
             else
-                printf "  [SKIP] %-28s (Not supported by kernel)\n" "$key"
+                [ "$SystemTuned" == "" ] && printf "  [SKIP] %-28s (Not supported by kernel)\n" "$key"
+                return 0
             fi
-        }
+        fi
 
-        # vm.max_map_count: Increased for games with many memory mappings (e.g., Star Citizen, many Proton games)
-        set_sysctl "vm.max_map_count" "2147483647" "Memory Mapping"
-        # kernel.numa_balancing: Disabled to prevent the kernel from automatically moving pages between NUMA nodes,
-        # which can cause inconsistent performance. We handle placement manually.
-        set_sysctl "kernel.numa_balancing" "0" "NUMA Contention"
-        # kernel.split_lock_mitigate: Disabled to avoid performance penalties when a process performs split-locks.
-        set_sysctl "kernel.split_lock_mitigate" "0" "Execution Latency"
-        # kernel.sched_migration_cost_ns: Increased to make the scheduler less aggressive about moving tasks
-        # between CPUs, which helps maintain cache locality.
-        set_sysctl "kernel.sched_migration_cost_ns" "5000000" "Scheduler"
-        # net.core.netdev_max_backlog: Increased for better handling of high-speed network traffic.
-        set_sysctl "net.core.netdev_max_backlog" "5000" "Network"
-        # Busy polling/reading: Lowers network latency for online games.
-        set_sysctl "net.core.busy_read" "50" "Network Latency"
-        set_sysctl "net.core.busy_poll" "50" "Network Latency"
-        # vm.stat_interval: Increased to reduce background "jitter" from virtual memory statistics gathering.
-        set_sysctl "vm.stat_interval" "10" "Jitter Reduction"
-        # kernel.nmi_watchdog: Disabled to reduce periodic interrupts that can cause micro-stutters.
-        set_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
-        
-        # PCIe Max Performance: Disables power management for the GPU and sets global ASPM policy
-        if [ "$MaxPerf" = true ]; then
-            # 1. Global ASPM policy to performance
-            if [ -f "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy" ]; then
+        if [ "$DryRun" = false ]; then
+            SYSCTL_CALLED=true
+            if sysctl -w "$key=$target_val" >/dev/null 2>&1; then
+                [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+            else
+                [ "$SystemTuned" == "" ] && printf "  [FAIL] %-28s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+            fi
+        else
+            [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+        fi
+    }
+
+    # Apply/Restore Sysctl Settings
+    manage_sysctl "vm.max_map_count" "2147483647" "Memory Mapping"
+    manage_sysctl "kernel.numa_balancing" "0" "NUMA Contention"
+    manage_sysctl "kernel.split_lock_mitigate" "0" "Execution Latency"
+    manage_sysctl "kernel.sched_migration_cost_ns" "5000000" "Scheduler"
+    manage_sysctl "net.core.netdev_max_backlog" "5000" "Network"
+    manage_sysctl "net.core.busy_read" "50" "Network Latency"
+    manage_sysctl "net.core.busy_poll" "50" "Network Latency"
+    manage_sysctl "vm.stat_interval" "10" "Jitter Reduction"
+    manage_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
+
+    # PCIe Max Performance
+    if [ "$MaxPerf" = true ] || [ "$action" = "restore" ]; then
+        # 1. Global ASPM policy
+        local policy_file="$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy"
+        if [ -f "$policy_file" ]; then
+            local target_aspm=$(get_target_val "pcie_aspm_policy" "performance")
+            if [ -n "$target_aspm" ]; then
+                [ "$action" = "tune" ] && persist_original_value "pcie_aspm_policy" "$(cat "$policy_file" 2>/dev/null)"
                 if [ "$DryRun" = false ]; then
-                    echo "performance" > "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy" 2>/dev/null
-                    printf "  [OK] %-30s -> %-10s (%s)\n" "pcie_aspm_policy" "performance" "PCIe Perf"
+                    echo "$target_aspm" > "$policy_file" 2>/dev/null
+                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "pcie_aspm_policy" "$target_aspm" "PCIe Perf"
                 else
-                    printf "  [DRY] %-29s -> %-10s (%s)\n" "pcie_aspm_policy" "performance" "PCIe Perf"
+                    [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "pcie_aspm_policy" "$target_aspm" "PCIe Perf"
                 fi
             fi
+        fi
 
-            # 2. Disable GPU Runtime Power Management
-            if [ -f "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control" ]; then
+        # 2. GPU Runtime PM
+        local rpm_file="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control"
+        if [ -f "$rpm_file" ]; then
+            local target_rpm=$(get_target_val "gpu_runtime_pm_control" "on")
+            if [ -n "$target_rpm" ]; then
+                [ "$action" = "tune" ] && persist_original_value "gpu_runtime_pm_control" "$(cat "$rpm_file" 2>/dev/null)"
                 if [ "$DryRun" = false ]; then
-                    echo "on" > "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control" 2>/dev/null
-                    printf "  [OK] %-30s -> %-10s (%s)\n" "gpu_runtime_pm" "off" "PCIe Perf"
+                    echo "$target_rpm" > "$rpm_file" 2>/dev/null
+                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "gpu_runtime_pm" "$target_rpm" "PCIe Perf"
                 else
-                    printf "  [DRY] %-29s -> %-10s (%s)\n" "gpu_runtime_pm" "off" "PCIe Perf"
+                    [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "gpu_runtime_pm" "$target_rpm" "PCIe Perf"
                 fi
             fi
+        fi
 
-            # 3. Disable GPU ASPM L1 and Clock PM if supported
-            for link_file in "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/l1_aspm" "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/clkpm"; do
-                if [ -f "$link_file" ]; then
-                    local link_name=$(basename "$link_file")
+        # 3. GPU ASPM/Clock PM
+        for link_name in "l1_aspm" "clkpm"; do
+            local link_file="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/$link_name"
+            if [ -f "$link_file" ]; then
+                local target_val=$(get_target_val "gpu_$link_name" "0")
+                if [ -n "$target_val" ]; then
+                    [ "$action" = "tune" ] && persist_original_value "gpu_$link_name" "$(cat "$link_file" 2>/dev/null)"
+                    local display_val="$target_val"
+                    [ "$target_val" = "0" ] && [ "$action" = "tune" ] && display_val="disabled"
                     if [ "$DryRun" = false ]; then
-                        echo "0" > "$link_file" 2>/dev/null
-                        printf "  [OK] %-30s -> %-10s (%s)\n" "gpu_$link_name" "disabled" "PCIe Perf"
+                        echo "$target_val" > "$link_file" 2>/dev/null
+                        [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "gpu_$link_name" "$display_val" "PCIe Perf"
                     else
-                        printf "  [DRY] %-29s -> %-10s (%s)\n" "gpu_$link_name" "disabled" "PCIe Perf"
+                        [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "gpu_$link_name" "$display_val" "PCIe Perf"
                     fi
                 fi
-            done
-        fi
+            fi
+        done
 
-        # Transparency Hugepages (THP): 'never' or 'madvise' reduces micro-stutters in games
-        if [ -f "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" ]; then
-            if [ "$DryRun" = false ]; then
-                echo "never" > "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" 2>/dev/null
-                printf "  [OK] %-30s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
-            else
-                printf "  [DRY] %-29s -> %-10s (%s)\n" "transparent_hugepage" "never" "Latency"
+        [ "$SystemTuned" == "" ] && SystemTuned=false
+    fi
+
+    # Transparent Hugepages (THP)
+    manage_thp() {
+        local key="$1"
+        local path="$2"
+        local tune_val="$3"
+        local label="$4"
+
+        if [ -f "$path" ]; then
+            local target_val=$(get_target_val "$key" "$tune_val")
+            if [ -n "$target_val" ]; then
+                [ "$action" = "tune" ] && persist_original_value "$key" "$(cat "$path" 2>/dev/null)"
+                if [ "$DryRun" = false ]; then
+                    echo "$target_val" > "$path" 2>/dev/null
+                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                else
+                    [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                fi
             fi
         fi
-        if [ -f "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" ]; then
-            if [ "$DryRun" = false ]; then
-                echo "never" > "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" 2>/dev/null
-                printf "  [OK] %-30s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
-            else
-                printf "  [DRY] %-29s -> %-10s (%s)\n" "thp_defrag" "never" "Latency"
-            fi
-        fi
+    }
+    manage_thp "transparent_hugepage" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" "never" "Latency"
+    manage_thp "thp_defrag" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" "never" "Latency"
 
-        # CPU Scaling Governor: Set to 'performance' for all cores
-        if [ -d "$SYSFS_PREFIX/sys/devices/system/cpu/cpufreq" ]; then
+    # CPU Scaling Governor
+    if [ -d "$SYSFS_PREFIX/sys/devices/system/cpu/cpufreq" ]; then
+        local target_gov=$(get_target_val "cpu_governor" "performance")
+        if [ -n "$target_gov" ]; then
+            if [ "$action" = "tune" ]; then
+                local first_gov_file=$(find "$SYSFS_PREFIX/sys/devices/system/cpu/cpu"*/cpufreq/scaling_governor -type f -print -quit 2>/dev/null)
+                if [ -n "$first_gov_file" ] && [ -f "$first_gov_file" ]; then
+                    persist_original_value "cpu_governor" "$(cat "$first_gov_file")"
+                fi
+            fi
             if [ "$DryRun" = false ]; then
+                local gov_applied=false
                 for gov in "$SYSFS_PREFIX"/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-                    [ -f "$gov" ] && echo "performance" > "$gov" 2>/dev/null
+                    if [ -f "$gov" ]; then
+                        echo "$target_gov" > "$gov" 2>/dev/null && gov_applied=true
+                    fi
                 done
-                printf "  [OK] %-30s -> %-10s (%s)\n" "cpu_governor" "performance" "Power/Perf"
+                if [ "$gov_applied" = true ]; then
+                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "cpu_governor" "$target_gov" "Power/Perf"
+                fi
             else
-                printf "  [DRY] %-29s -> %-10s (%s)\n" "cpu_governor" "performance" "Power/Perf"
+                [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "cpu_governor" "$target_gov" "Power/Perf"
             fi
         fi
+    fi
 
+    if [ "$action" = "tune" ]; then
         if pgrep -x numad >/dev/null 2>&1; then
-            echo "  [WARNING] numad daemon is running. This may contend with manual optimization."
-            echo "            Consider stopping it: 'sudo systemctl stop numad'"
+            [ "$SystemTuned" == "" ] && echo "  [WARNING] numad daemon is running. This may contend with manual optimization."
+            [ "$SystemTuned" == "" ] && echo "            Consider stopping it: 'sudo systemctl stop numad'"
         fi
+        [ "$SystemTuned" == "" ] && echo "--> System tuning complete."
+        [ "$SystemTuned" == "" ] && echo "------------------------------------------------------------------------------------------------"
+    fi
+    return 0
+}
 
-        echo "--> System tuning complete."
-        echo "------------------------------------------------------------------------------------------------"
+# Triggers system-wide action (tune/restore)
+trigger_system_management() {
+    local action="$1" # "tune" or "restore"
+    local target_state
+    local pipe_msg
+
+    if [ "$action" = "tune" ]; then
+        [ "$SystemTuned" = true ] && return 0
+        target_state=true
+        pipe_msg="TUNE"
     else
-        echo "------------------------------------------------------------------------------------------------"
-        echo "WARNING: Not running as root. Latency tuning skipped."
-        echo "------------------------------------------------------------------------------------------------"
-        sleep 1
+        [ "$SystemTuned" = false ] && return 0
+        target_state=false
+        pipe_msg="RESTORE"
+    fi
+
+    local eff_euid="${MOCK_EUID:-$EUID}"
+    if [ "$eff_euid" -eq 0 ]; then
+        if system_manage_settings "$action"; then
+            SystemTuned="$target_state"
+        fi
+    elif [ -n "$CommPipe" ] && [ -p "$CommPipe" ]; then
+        if echo "$pipe_msg" > "$CommPipe" 2>/dev/null; then
+            SystemTuned="$target_state"
+        fi
     fi
 }
+
 
 # --- Core Logic & Execution ---
 
@@ -759,6 +893,8 @@ run_optimization() {
         fi
 
         if ! is_gaming_process "$pid"; then continue; fi
+
+        trigger_system_management "tune"
 
         local proc_comm=$(ps -p "$pid" -o comm=)
         local full_proc_cmd=$(ps -fp "$pid" -o args= | tail -n 1)
@@ -919,24 +1055,22 @@ summarize_optimizations() {
     done
 
     local current_optimized_count=${#OptimizedPidsMap[@]}
-    local summary_msg=""
-    local summary_status="SCANNING"
 
     # Trigger summary if forced, interval passed, or if we just dropped to zero optimized processes
     local should_summarize=false
     if [ "$force_summary" = true ] || [ $((now - LastSummaryTime)) -ge "$SummaryInterval" ]; then
         should_summarize=true
-        if [ "$current_optimized_count" -eq 0 ]; then
-            summary_msg="No processes currently optimized"
-        fi
     elif [ "$LastOptimizedCount" -gt 0 ] && [ "$current_optimized_count" -eq 0 ]; then
-        # Just dropped to zero, trigger immediate summary
         should_summarize=true
-        summary_msg="No optimized processes remaining"
-        summary_status="IDLE"
     fi
 
     LastOptimizedCount=$current_optimized_count
+
+    local summary_msg=""
+    if [ "$current_optimized_count" -eq 0 ]; then
+        trigger_system_management "restore"
+        summary_msg="No processes currently optimized"
+    fi
 
     if [ "$should_summarize" = true ]; then
         if [ "$force_summary" = false ] && [ $((now - LastOptimizationTime)) -ge "$SummarySilenceTimeout" ]; then
@@ -951,7 +1085,7 @@ summarize_optimizations() {
             return
         fi
 
-        status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "$summary_status" ""
+        status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "OPTIMIZING" "$summary_msg"
 
         PcieWarningLogged=false
         if [ "$current_optimized_count" -gt 0 ]; then
@@ -1040,6 +1174,7 @@ parse_args() {
             -f|--max-perf) MaxPerf=true; shift ;;
             -n|--dry-run) DryRun=true; shift ;;
             -k|--no-drop) DropPrivs=false; shift ;;
+            --comm-pipe) CommPipe=$2; shift 2 ;;
             -m|--max-log-lines) 
                 if [[ "$2" =~ ^[0-9]+$ ]]; then
                     MaxAllTimeLogLines=$2; shift 2
@@ -1120,24 +1255,85 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     # Parse CLI arguments (they override configuration files)
     parse_args "$@"
     check_dependencies
-    system_tune
+    system_manage_settings "tune"
     detect_target_user
 
-    # Drop privileges if a target user was detected, we are root, and dropping is enabled.
-    # This allows the script to perform system tuning as root, then switch to the user
-    # context for monitoring and optimizing user-owned processes.
+    # Root-privileged parent loop
     if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
-        echo "--> Dropping privileges to $TargetUser..."
-        # Re-execute the script as the target user. 
-        # --no-tune: Skip system_tune in the child as it requires root.
-        # --no-drop: Prevent infinite re-execution loops.
-        exec setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "${OriginalArgs[@]}"
+        echo "--> Starting root management process..."
+        
+        # Create a named pipe for child-to-parent communication
+        CommPipe=$(mktemp -u)
+        mkfifo "$CommPipe"
+        # Set permissions so root can read/write and the target group can write
+        chmod 660 "$CommPipe"
+        
+        # Parent stays root and waits for signals or pipe commands
+        # Open FIFO for reading and writing to prevent 'read' from closing on EOF
+        # We open it BEFORE changing ownership to avoid 'Permission denied' 
+        # when fs.protected_fifos=1 (root must open it while it owns it in /tmp)
+        exec 3<> "$CommPipe"
+
+        # Change group to target user's group so they can write to it
+        chown "root:$TargetGid" "$CommPipe"
+
+        # Signal handlers for the parent
+        trap '[ -e "/dev/fd/3" ] && exec 3>&-; rm -f "$CommPipe"; system_manage_settings "restore"; exit 0' TERM INT QUIT
+
+        # Fork the child process
+        (
+            echo "--> Dropping privileges to $TargetUser..."
+            # Re-execute the script as the target user.
+            # --no-tune: Skip system_tune in the child as it requires root.
+            # --no-drop: Prevent infinite re-execution loops.
+            setpriv --reuid="$TargetUid" --regid="$TargetGid" --init-groups -- "$0" "--no-tune" "--no-drop" "--comm-pipe" "$CommPipe" "${OriginalArgs[@]}"
+            # When child exits, signal the parent to exit too
+            kill -TERM "$$" 2>/dev/null
+        ) &
+        ChildPid=$!
+        
+        while [ -e "/dev/fd/3" ]; do
+            if read -t 1 -r cmd <&3 2>/dev/null; then
+                case "$cmd" in
+                    TUNE) system_manage_settings "tune" ;;
+                    RESTORE) system_manage_settings "restore" ;;
+                    EXIT) break ;;
+                esac
+            fi
+
+            # Check if child is still alive. If child is gone, exit.
+            if ! kill -0 "$ChildPid" 2>/dev/null; then
+                echo "--> Child process exited. Shutting down root manager."
+                break
+            fi
+        done
+        [ -e "/dev/fd/3" ] && exec 3>&-
+        rm -f "$CommPipe"
+        
+        # Kill child process if it's still alive (e.g. if parent got SIGTERM)
+        if kill -0 "$ChildPid" 2>/dev/null; then
+            kill -TERM "$ChildPid" 2>/dev/null
+            wait "$ChildPid" 2>/dev/null
+        fi
+
+        system_manage_settings "restore"
+        exit 0
     fi
+
+    # Everything below runs either as root (if DropPrivs=false) 
+    # or as the target user (if DropPrivs=true, in the child process).
 
     detect_gpu
     discover_resources
     filter_cpus
     load_all_time_stats
+
+    # Setup signal handlers for cleanup
+    trap 'trigger_system_management "restore"; exit 0' TERM INT QUIT
+
+    # If running as child, the parent might already be terminating us.
+    # We should ensure we don't leave zombie processes if we have children.
+    # (Though this script doesn't normally fork other long-running processes)
 
     print_banner
     summarize_optimizations true
@@ -1151,19 +1347,22 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             # (e.g., a game launcher starting the game engine) to appear.
             if [ ${#PendingOptimizations[@]} -gt 0 ]; then
                 log "Optimized ${#PendingOptimizations[@]} process(es). Waiting ${SleepInterval}s to aggregate more..."
-                sleep "$SleepInterval"
+                sleep "$SleepInterval" &
+                wait $!
                 # Run one more time to catch immediate followers
                 run_optimization
                 flush_notifications
             fi
 
             summarize_optimizations
-            sleep "$SleepInterval"
+            sleep "$SleepInterval" &
+            wait $!
         done
     else
         # Single-run mode
         run_optimization
         flush_notifications
+        summarize_optimizations # Ensure restoration happens if needed
         echo "------------------------------------------------------------------------------------------------"
         echo "Optimization complete."
     fi

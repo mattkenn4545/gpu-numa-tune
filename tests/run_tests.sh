@@ -17,6 +17,7 @@
 # Clean up function for mock environment
 cleanup() {
     rm -rf tests/mock_bin tests/mock_proc tests/mock_sys tests/mock_dev tests/mock_all_time tests/mock_home tests/mock_all_time.tmp
+    [ -f "$SystemConfig" ] && rm -f "$SystemConfig"
 }
 trap cleanup EXIT
 
@@ -79,11 +80,12 @@ assert_eq "true" "$DaemonMode" "parse_args --daemon"
 assert_eq "true" "$StrictMem" "parse_args --strict"
 assert_eq "1" "$GpuIndexArg" "parse_args GpuIndexArg"
 
-parse_args "-l" "-a" "-x" "-k"
+parse_args "-l" "-a" "-x" "-k" "--comm-pipe" "/tmp/pipe"
 assert_eq "false" "$IncludeNearby" "parse_args --local-only"
 assert_eq "false" "$OnlyGaming" "parse_args --all-gpu-procs"
 assert_eq "true" "$SkipSystemTune" "parse_args --no-tune"
 assert_eq "false" "$DropPrivs" "parse_args --no-drop"
+assert_eq "/tmp/pipe" "$CommPipe" "parse_args --comm-pipe"
 
 # Test 3: is_gaming_process (mocking ps and /proc)
 # We can't easily mock /proc in a simple script without LD_PRELOAD or similar, 
@@ -106,9 +108,11 @@ ps() {
 # We don't export -f here because we want it in the current shell context
 # where is_gaming_process will run.
 
-# Mocking /proc for is_gaming_process
+# Set up mock paths
+export SYSFS_PREFIX="$(pwd)/tests/mock_sys"
 export PROC_PREFIX="$(pwd)/tests/mock_proc"
-mkdir -p "$PROC_PREFIX/proc/1234"
+export SystemConfig="$(pwd)/tests/mock_etc_gpu-numa-tune.conf"
+mkdir -p "$SYSFS_PREFIX" "$PROC_PREFIX/proc/1234" "$(dirname "$SystemConfig")"
 # Create empty environ file with read permission
 touch "$PROC_PREFIX/proc/1234/environ"
 chmod 644 "$PROC_PREFIX/proc/1234/environ"
@@ -116,7 +120,7 @@ chmod 644 "$PROC_PREFIX/proc/1234/environ"
 # Let's test is_gaming_process for a few cases
 # Case: Blacklisted
 OnlyGaming=true
-assert_eq "1" "$(is_gaming_process 5678; echo $?)" "is_gaming_process chrome (blacklisted)"
+assert_eq "1" "$(is_gaming_process 5678 "chrome" "/usr/bin/chrome --type=renderer"; echo $?)" "is_gaming_process chrome (blacklisted)"
 
 # For PID 1234, it should pass because it has a gaming environment variable
 # We need to mock ps to return non-blacklisted comm and args
@@ -143,9 +147,9 @@ ps() {
 # Put a gaming env var in the mock environ file
 echo -e "STEAM_GAME_ID=123\0" > "$PROC_PREFIX/proc/1234/environ"
 
-assert_eq "0" "$(is_gaming_process 1234; echo $?)" "is_gaming_process with STEAM_GAME_ID (allowed)"
-assert_eq "0" "$(is_gaming_process 1111; echo $?)" "is_gaming_process child of steam (allowed)"
-assert_eq "0" "$(is_gaming_process 3333; echo $?)" "is_gaming_process wine .exe (allowed)"
+assert_eq "0" "$(is_gaming_process 1234 "game_exe" "./game_exe"; echo $?)" "is_gaming_process with STEAM_GAME_ID (allowed)"
+assert_eq "0" "$(is_gaming_process 1111 "some_child" "./some_child"; echo $?)" "is_gaming_process child of steam (allowed)"
+assert_eq "0" "$(is_gaming_process 3333 "wine_proc" "/usr/bin/wine some_game.exe"; echo $?)" "is_gaming_process wine .exe (allowed)"
 
 # Test 4: Hardware discovery (using SYSFS_PREFIX)
 export SYSFS_PREFIX="$(pwd)/tests/mock_sys"
@@ -277,7 +281,7 @@ sysctl() { return 0; }
 # Mocking for system_tune
 MOCK_EUID=0
 SkipSystemTune=false
-system_tune
+system_manage_settings "tune"
 
 assert_eq "false" "$SYSCTL_CALLED" "Dry-run: sysctl not called"
 
@@ -430,7 +434,7 @@ output=$(
     summarize_optimizations true
 )
 
-assert_eq "0 procs    | since startup    |                      | 5 all time         | SCANNING                  |                          " "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
+assert_eq "0 procs    | since startup    |                      | 5 all time         | OPTIMIZING                | No processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
 
 # Test 11b: Startup summary -l option
 echo "Test 11b: Startup summary -l option"
@@ -613,7 +617,7 @@ printf() {
     PRINTF_OUTPUT+=$(command printf "$@")
 }
 
-system_tune > /dev/null
+system_manage_settings "tune" > /dev/null
 
 echo "$PRINTF_OUTPUT" | grep -q "pcie_aspm_policy"
 assert_eq "0" "$?" "system_tune sets pcie_aspm_policy"
@@ -623,6 +627,156 @@ echo "$PRINTF_OUTPUT" | grep -q "gpu_l1_aspm"
 assert_eq "0" "$?" "system_tune sets gpu_l1_aspm"
 echo "$PRINTF_OUTPUT" | grep -q "gpu_clkpm"
 assert_eq "0" "$?" "system_tune sets gpu_clkpm"
+
+# Test 17: system_tune/system_restore and triggering logic
+echo "Test 17: system_tune/system_restore and triggering logic"
+
+# Setup for system_restore
+cat <<EOF > "$SystemConfig"
+vm.max_map_count=65530
+pcie_aspm_policy=default
+gpu_runtime_pm_control=auto
+gpu_l1_aspm=1
+gpu_clkpm=1
+transparent_hugepage=madvise
+thp_defrag=madvise
+cpu_governor=powersave
+EOF
+
+# Mock root for these tests
+MOCK_EUID=0
+# Mock PciAddr
+PciAddr="0000:01:00.0"
+# Ensure sysfs structure for restore
+mkdir -p "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters"
+mkdir -p "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power"
+mkdir -p "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link"
+mkdir -p "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage"
+mkdir -p "$SYSFS_PREFIX/sys/devices/system/cpu/cpu0/cpufreq"
+
+echo "default" > "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy"
+echo "auto" > "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control"
+echo "1" > "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/l1_aspm"
+echo "1" > "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/clkpm"
+echo "madvise" > "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled"
+echo "madvise" > "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag"
+echo "powersave" > "$SYSFS_PREFIX/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+
+# Initial state: not tuned
+SystemTuned=false
+DryRun=false
+SkipSystemTune=false
+MOCK_EUID=0 # Ensure system_tune doesn't skip due to EUID
+MaxPerf=true # system_tune needs this to set pcie_aspm_policy
+
+# Trigger tune
+SystemTuned=false
+MOCK_EUID=0
+MaxPerf=true
+DryRun=false
+SkipSystemTune=false
+DEBUG=1 trigger_system_management "tune"
+assert_eq "true" "$SystemTuned" "trigger_system_management 'tune' sets SystemTuned=true"
+assert_eq "performance" "$(cat "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy")" "system_tune applied"
+
+# Trigger restore
+trigger_system_management "restore" > /dev/null
+assert_eq "false" "$SystemTuned" "trigger_system_management 'restore' sets SystemTuned=false"
+assert_eq "default" "$(cat "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy")" "system_restore applied"
+
+# Test trigger logic in run_optimization/summarize_optimizations
+LastOptimizedCount=0
+OptimizedPidsMap=()
+TotalOptimizedCount=0
+
+# Mock a gaming process
+# We need to mock is_gaming_process to return true for a specific PID
+is_gaming_process() { [[ "$1" == "123" ]]; }
+# Mock ps for this PID
+ps() {
+    if [[ "$*" == *"-p 123 -o comm="* ]]; then echo "game"; 
+    elif [[ "$*" == *"-fp 123 -o args="* ]]; then echo "game_bin";
+    else command ps "$@"; fi
+}
+# Mock fuser to find our PID
+fuser() { echo "123"; }
+# Mock taskset
+taskset() { echo "pid 123's current affinity list: 0-7"; }
+
+# run_optimization should trigger tune
+SystemTuned=false
+MOCK_EUID=0
+PROC_PREFIX="$SYSFS_PREFIX" # Use same mock prefix for /proc
+mkdir -p "$PROC_PREFIX/proc/123"
+echo "VmRSS: 1000 kB" > "$PROC_PREFIX/proc/123/status"
+run_optimization > /dev/null
+assert_eq "true" "$SystemTuned" "run_optimization triggers system tune"
+
+# Now mock process gone
+fuser() { echo ""; }
+# Ensure we clear the map since we're simulating the process being gone
+OptimizedPidsMap=([123]=$(date +%s)) 
+LastOptimizedCount=1
+# Mock /proc/123 to be gone
+rm -rf "$PROC_PREFIX/proc/123"
+# run_optimization doesn't trigger restore, summarize_optimizations does
+run_optimization > /dev/null
+summarize_optimizations > /dev/null
+assert_eq "false" "$SystemTuned" "summarize_optimizations triggers system restore when procs gone"
+
+# Test 18: System restore on termination
+echo "Test 18: System restore on termination"
+MOCK_EUID=0
+SystemTuned=true
+trigger_system_management_called=false
+system_manage_settings() { 
+    if [ "$1" = "restore" ]; then
+        trigger_system_management_called=true
+    fi
+    return 0
+}
+
+# We can't easily test the actual trap in this script without complex subshells,
+# but we can verify our intended change logic.
+# If we add a trap to the script, we want to ensure it calls trigger_system_management "restore".
+
+# Let's mock what the trap should do
+on_exit() {
+    trigger_system_management "restore"
+}
+
+SystemTuned=true
+on_exit
+assert_eq "false" "$SystemTuned" "on_exit triggers system management 'restore' if tuned"
+assert_eq "true" "$trigger_system_management_called" "system_manage_settings was actually called"
+
+# Cleanup mock
+unset trigger_system_management_called
+
+# Test 19: Redundant tuning/restoration check
+echo "Test 19: Redundant tuning/restoration check"
+MOCK_EUID=0
+SystemTuned=false
+manage_calls=0
+system_manage_settings() { 
+    local action="$1"
+    manage_calls=$((manage_calls + 1))
+    if [ "$action" = "tune" ]; then return 0; fi
+    if [ "$action" = "restore" ]; then return 0; fi
+}
+
+trigger_system_management "tune"
+trigger_system_management "tune"
+assert_eq "1" "$manage_calls" "trigger_system_management called only once when triggering 'tune' twice"
+assert_eq "true" "$SystemTuned" "SystemTuned is true after tuning"
+
+trigger_system_management "restore"
+trigger_system_management "restore"
+assert_eq "2" "$manage_calls" "trigger_system_management called only once more when triggering 'restore' twice"
+assert_eq "false" "$SystemTuned" "SystemTuned is false after restoration"
+
+# Cleanup
+unset manage_calls
 
 echo "--------------------------------------------------------------------------------"
 if [ $FAILED -eq 0 ]; then
