@@ -165,21 +165,22 @@ EOF
 }
 
 # State Tracking
-SystemTuned=""               # Tracks if system optimizations are currently applied (true/false/empty)
-declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
-declare -A BatchedProcInfoMap # Map of PID -> "PPID|COMM|ARGS"
-TotalOptimizedCount=0        # Total number of unique processes optimized since script start
-PerformanceWarningsCount=0   # Total number of 20s+ loop warnings since script start
-LastOptimizedCount=-1        # Number of optimized processes in the last check
-AllTimeFile=""               # Path to the all-time tracking file
-LifetimeOptimizedCount=0     # Total number of unique processes optimized across all runs
-LastSummaryTime=$(date +%s)  # Timestamp of the last periodic summary report
-LastOptimizationTime=$(date +%s) # Timestamp of the last successful optimization
-SummarySilenced=false        # True if we have silenced periodic summaries due to inactivity
-SummaryInterval=1800         # Interval between periodic summary reports (seconds)
-SummarySilenceTimeout=7200   # Stop summary messages after 2 hours of inactivity
-LogLineCount=9999            # Counter to track when to re-print table headers
-HeaderInterval=20            # Number of log lines before repeating the table header
+SystemTuned=""                    # Tracks if system optimizations are currently applied (true/false/empty)
+declare -A OptimizedPidsMap       # Map of PID -> Unix timestamp of when it was first optimized
+declare -A NonGamingPidsMap       # Map of PID -> Unix timestamp of when it was identified as non-gaming
+declare -A BatchedProcInfoMap     # Map of PID -> "PPID|COMM|ARGS"
+TotalOptimizedCount=0             # Total number of unique processes optimized since script start
+PerformanceWarningsCount=0        # Total number of 20s+ loop warnings since script start
+LastOptimizedCount=-1             # Number of optimized processes in the last check
+AllTimeFile=""                    # Path to the all-time tracking file
+LifetimeOptimizedCount=0          # Total number of unique processes optimized across all runs
+LastSummaryTime=$(date +%s)       # Timestamp of the last periodic summary report
+LastOptimizationTime=$(date +%s)  # Timestamp of the last successful optimization
+SummarySilenced=false             # True if we have silenced periodic summaries due to inactivity
+SummaryInterval=1800              # Interval between periodic summary reports (seconds)
+SummarySilenceTimeout=7200        # Stop summary messages after 2 hours of inactivity
+LogLineCount=9999                 # Counter to track when to re-print table headers
+HeaderInterval=20                 # Number of log lines before repeating the table header
 
 # Notification Buffer
 declare -a PendingOptimizations # Queue of optimization events waiting to be displayed to the user
@@ -713,6 +714,11 @@ is_gaming_process() {
 
     [ "$OnlyGaming" = false ] && return 0
 
+    # 0. Cache Check
+    if [ -n "${NonGamingPidsMap[$pid]}" ]; then
+        return 1
+    fi
+
     local cached_info="${BatchedProcInfoMap[$pid]}"
     local proc_comm=""
     local proc_args=""
@@ -729,13 +735,24 @@ is_gaming_process() {
 
     # 1. Known Blacklist
     case "$proc_comm" in
-        Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) return 1 ;;
-        chrome|firefox|brave|msedge|opera|browser|chromium) return 1 ;;
-        steamwebhelper|Discord|slack|teams|obs|obs64|heroic|lutris|fossilize_repla) return 1 ;;
+        Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) 
+            NonGamingPidsMap["$pid"]=$(date +%s)
+            return 1 
+            ;;
+        chrome|firefox|brave|msedge|opera|browser|chromium) 
+            NonGamingPidsMap["$pid"]=$(date +%s)
+            return 1 
+            ;;
+        steamwebhelper|Discord|slack|teams|obs|obs64|heroic|lutris|fossilize_repla) 
+            NonGamingPidsMap["$pid"]=$(date +%s)
+            return 1 
+            ;;
     esac
 
     # 2. UI/Utility Heuristics
-    if echo "$proc_args" | grep -qiE -- "--type=(zygote|renderer|gpu-process|utility|extension-process|worker-process)"; then
+    local ui_regex="--type=(zygote|renderer|gpu-process|utility|extension-process|worker-process)"
+    if [[ "$proc_args" =~ $ui_regex ]]; then
+        NonGamingPidsMap["$pid"]=$(date +%s)
         return 1
     fi
 
@@ -748,7 +765,8 @@ is_gaming_process() {
     fi
 
     # 4. Binary Name Heuristics
-    if echo "$proc_args" | grep -qiE "\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer|UnrealEditor|Solaris|GZDoom"; then
+    local binary_regex="\.exe|wine|proton|reaper|Game\.x86_64|UnityPlayer|UnrealEditor|Solaris|GZDoom"
+    if [[ "$proc_args" =~ $binary_regex ]]; then
         return 0
     fi
 
@@ -773,6 +791,7 @@ is_gaming_process() {
         ppid="$next_ppid"
     done
 
+    NonGamingPidsMap["$pid"]=$(date +%s)
     return 1
 }
 
@@ -1183,6 +1202,14 @@ get_proc_info() {
 run_optimization() {
     # Batch load process info to minimize forks in the loop
     batch_load_proc_info
+
+    # Periodic cleanup of non-gaming cache to handle PID reuse
+    local now=$(date +%s)
+    for pid in "${!NonGamingPidsMap[@]}"; do
+        if [ ! -d "$PROC_PREFIX/proc/$pid" ] || [ $((now - NonGamingPidsMap[$pid])) -gt 3600 ]; then
+            unset "NonGamingPidsMap[$pid]"
+        fi
+    done
 
     # Cross-vendor PID detection (Render nodes and NVIDIA devices)
     local gpu_pids=$(fuser /dev/dri/renderD* /dev/nvidia* 2>/dev/null | tr ' ' '\n' | sort -u)

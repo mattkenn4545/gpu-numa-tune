@@ -163,6 +163,13 @@ assert_eq "0" "$(is_gaming_process 1234; echo $?)" "is_gaming_process with STEAM
 assert_eq "0" "$(is_gaming_process 1111; echo $?)" "is_gaming_process child of steam (allowed)"
 assert_eq "0" "$(is_gaming_process 3333; echo $?)" "is_gaming_process wine .exe (allowed)"
 
+# Test 3.1: is_gaming_process caching
+NonGamingPidsMap=()
+# PID 5678 is chrome (blacklisted)
+is_gaming_process 5678 > /dev/null
+assert_eq "1" "$(is_gaming_process 5678; echo $?)" "is_gaming_process uses cache for non-gaming"
+assert_eq "true" "$( [ -n "${NonGamingPidsMap[5678]}" ] && echo true )" "NonGamingPidsMap populated"
+
 # Test 4: Hardware discovery (using SYSFS_PREFIX)
 export SYSFS_PREFIX="$(pwd)/tests/mock_sys"
 mkdir -p "$SYSFS_PREFIX/sys/bus/pci/devices/0000:01:00.0"
