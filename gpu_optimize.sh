@@ -168,6 +168,7 @@ EOF
 SystemTuned=""               # Tracks if system optimizations are currently applied (true/false/empty)
 declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
 TotalOptimizedCount=0        # Total number of unique processes optimized since script start
+PerformanceWarningsCount=0   # Total number of 20s+ loop warnings since script start
 LastOptimizedCount=-1        # Number of optimized processes in the last check
 AllTimeFile=""               # Path to the all-time tracking file
 LifetimeOptimizedCount=0     # Total number of unique processes optimized across all runs
@@ -1281,6 +1282,10 @@ summarize_optimizations() {
 
         status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "OPTIMIZING" "$summary_msg"
 
+        if [ "$PerformanceWarningsCount" -gt 0 ]; then
+            log "Notice: $PerformanceWarningsCount performance warnings (20s+ loop) recorded since startup."
+        fi
+
         PcieWarningLogged=false
         if [ "$current_optimized_count" -gt 0 ]; then
             check_pcie_speed
@@ -1530,6 +1535,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     if [ "$DaemonMode" = true ]; then
         # Continuous monitoring loop
         while true; do
+            loop_start=$(date +%s%N)
             run_optimization
 
             # Aggregate notifications to avoid spamming the user.
@@ -1537,12 +1543,28 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             # (e.g., a game launcher starting the game engine) to appear.
             if [ ${#PendingOptimizations[@]} -gt 0 ]; then
                 log "Optimized ${#PendingOptimizations[@]} process(es). Waiting ${SleepInterval}s to aggregate more..."
+                # Sleep to give launchers etc... time to get all processes started
+                sleep "$SleepInterval" &
+                wait $!
                 # Run one more time to catch immediate followers
                 run_optimization
                 flush_notifications
             fi
 
+            # Summarize optimizations performed in this loop
             summarize_optimizations
+
+            loop_end=$(date +%s%N)
+            duration_ns=$((loop_end - loop_start))
+            duration_ms=$((duration_ns / 1000000))
+
+            if [ "$duration_ms" -gt 20000 ]; then
+                warning_msg="Daemon loop took ${duration_ms}ms (exceeding 20s warning threshold)"
+                echo "WARNING: $warning_msg"
+                # Record that a performance warning occurred for the summary
+                ((PerformanceWarningsCount++))
+            fi
+
             sleep "$SleepInterval" &
             wait $!
         done
