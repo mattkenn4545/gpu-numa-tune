@@ -101,38 +101,16 @@ assert_eq "/tmp/pipe" "$CommPipe" "parse_args --comm-pipe"
 
 # Mocking ps
 ps() {
-    if [[ "$*" == *"-p 1234 -o comm="* ]]; then
-        echo "steam"
-    elif [[ "$*" == *"-p 5678 -o comm="* ]]; then
-        echo "chrome"
-    elif [[ "$*" == *"-fp 1234 -o args="* ]]; then
-        echo "/usr/bin/steam"
-    elif [[ "$*" == *"-fp 5678 -o args="* ]]; then
-        echo "/usr/bin/chrome --type=renderer"
-    else
-        command ps "$@"
+    if [[ "$*" == *"--no-headers"* ]]; then
+        # Handle batch_load_proc_info
+        echo " 5678     1 chrome          /usr/bin/chrome --type=renderer"
+        echo " 1234     1 game_exe        ./game_exe"
+        echo " 1111  2222 some_child      ./some_child"
+        echo " 2222     1 steam           /usr/bin/steam"
+        echo " 3333     1 wine_proc       /usr/bin/wine some_game.exe"
+        echo " 9999     1 game_exe        game_exe"
+        return
     fi
-}
-# We don't export -f here because we want it in the current shell context
-# where is_gaming_process will run.
-
-# Set up mock paths
-export SYSFS_PREFIX="$(pwd)/tests/mock_sys"
-export PROC_PREFIX="$(pwd)/tests/mock_proc"
-export SystemConfig="$(pwd)/tests/mock_etc_gpu-numa-tune.conf"
-mkdir -p "$SYSFS_PREFIX" "$PROC_PREFIX/proc/1234" "$(dirname "$SystemConfig")"
-# Create empty environ file with read permission
-touch "$PROC_PREFIX/proc/1234/environ"
-chmod 644 "$PROC_PREFIX/proc/1234/environ"
-
-# Let's test is_gaming_process for a few cases
-# Case: Blacklisted
-OnlyGaming=true
-assert_eq "1" "$(is_gaming_process 5678 "chrome" "/usr/bin/chrome --type=renderer"; echo $?)" "is_gaming_process chrome (blacklisted)"
-
-# For PID 1234, it should pass because it has a gaming environment variable
-# We need to mock ps to return non-blacklisted comm and args
-ps() {
     case "$*" in
         *"-p 1234 -o comm="*) echo "game_exe" ;;
         *"-p 5678 -o comm="*) echo "chrome" ;;
@@ -148,16 +126,42 @@ ps() {
         *"-p 3333 -o comm="*) echo "wine_proc" ;;
         *"-fp 3333 -o args="*) echo "/usr/bin/wine some_game.exe" ;;
         *"-p 3333 -o ppid="*) echo "1" ;;
+        *"-p 9999 -o comm="*) echo "game_exe" ;;
+        *"-fp 9999 -o args="*) echo "game_exe" ;;
+        *"-p 9999 -o ppid="*) echo "1" ;;
         *) command ps "$@" ;;
     esac
 }
 
+# We don't export -f here because we want it in the current shell context
+# where is_gaming_process will run.
+
+# Set up mock paths
+export SYSFS_PREFIX="$(pwd)/tests/mock_sys"
+export PROC_PREFIX="$(pwd)/tests/mock_proc"
+export SystemConfig="$(pwd)/tests/mock_etc_gpu-numa-tune.conf"
+mkdir -p "$SYSFS_PREFIX" "$PROC_PREFIX/proc/1234" "$(dirname "$SystemConfig")"
+mkdir -p "$PROC_PREFIX/proc/5678" "$PROC_PREFIX/proc/1111" "$PROC_PREFIX/proc/2222" "$PROC_PREFIX/proc/3333" "$PROC_PREFIX/proc/9999"
+
+# Create empty environ file with read permission
+touch "$PROC_PREFIX/proc/1234/environ"
+chmod 644 "$PROC_PREFIX/proc/1234/environ"
+
+# Ensure batch info is loaded for tests that don't call run_optimization
+batch_load_proc_info
+
+# Let's test is_gaming_process for a few cases
+# Case: Blacklisted
+OnlyGaming=true
+assert_eq "1" "$(is_gaming_process 5678; echo $?)" "is_gaming_process chrome (blacklisted)"
+
+# For PID 1234, it should pass because it has a gaming environment variable
 # Put a gaming env var in the mock environ file
 echo -e "STEAM_GAME_ID=123\0" > "$PROC_PREFIX/proc/1234/environ"
 
-assert_eq "0" "$(is_gaming_process 1234 "game_exe" "./game_exe"; echo $?)" "is_gaming_process with STEAM_GAME_ID (allowed)"
-assert_eq "0" "$(is_gaming_process 1111 "some_child" "./some_child"; echo $?)" "is_gaming_process child of steam (allowed)"
-assert_eq "0" "$(is_gaming_process 3333 "wine_proc" "/usr/bin/wine some_game.exe"; echo $?)" "is_gaming_process wine .exe (allowed)"
+assert_eq "0" "$(is_gaming_process 1234; echo $?)" "is_gaming_process with STEAM_GAME_ID (allowed)"
+assert_eq "0" "$(is_gaming_process 1111; echo $?)" "is_gaming_process child of steam (allowed)"
+assert_eq "0" "$(is_gaming_process 3333; echo $?)" "is_gaming_process wine .exe (allowed)"
 
 # Test 4: Hardware discovery (using SYSFS_PREFIX)
 export SYSFS_PREFIX="$(pwd)/tests/mock_sys"

@@ -167,6 +167,7 @@ EOF
 # State Tracking
 SystemTuned=""               # Tracks if system optimizations are currently applied (true/false/empty)
 declare -A OptimizedPidsMap  # Map of PID -> Unix timestamp of when it was first optimized
+declare -A BatchedProcInfoMap # Map of PID -> "PPID|COMM|ARGS"
 TotalOptimizedCount=0        # Total number of unique processes optimized since script start
 PerformanceWarningsCount=0   # Total number of 20s+ loop warnings since script start
 LastOptimizedCount=-1        # Number of optimized processes in the last check
@@ -682,6 +683,24 @@ get_overrides() {
     echo "${overrides%,}"
 }
 
+# Batch load process information into a global map to minimize ps forks.
+batch_load_proc_info() {
+    # Clear the existing map
+    BatchedProcInfoMap=()
+
+    # Capture pid, ppid, comm, and args in one go.
+    # Using a while loop with read is generally more robust for parsing ps output.
+    # We use a custom delimiter (if possible) or just rely on positional parsing.
+    # ps -eo pid:10,ppid:10,comm:32,args
+    # Note: comm might have spaces, but args definitely will.
+    # Standard ps -eo pid,ppid,comm,args output:
+    #   PID  PPID COMMAND         COMMAND
+    while read -r l_pid l_ppid l_comm l_args; do
+        [[ "$l_pid" =~ ^[0-9]+$ ]] || continue
+        BatchedProcInfoMap["$l_pid"]="$l_ppid|$l_comm|$l_args"
+    done < <(ps -eo pid,ppid,comm,args --no-headers 2>/dev/null)
+}
+
 # Determines if a PID should be optimized based on its environment and command line.
 # This function applies several layers of heuristics to identify games:
 # 1. Checks a blacklist of common desktop/system apps (browsers, shells, etc.).
@@ -694,8 +713,21 @@ is_gaming_process() {
 
     [ "$OnlyGaming" = false ] && return 0
 
+    local cached_info="${BatchedProcInfoMap[$pid]}"
+    local proc_comm=""
+    local proc_args=""
+    local ppid=""
+
+    if [ -n "$cached_info" ]; then
+        IFS='|' read -r ppid proc_comm proc_args <<< "$cached_info"
+    else
+        # Fallback if not in cache (should not happen if batch_load_proc_info was called)
+        proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+        proc_args=$(ps -fp "$pid" -o args= 2>/dev/null)
+        ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+    fi
+
     # 1. Known Blacklist
-    local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
     case "$proc_comm" in
         Xorg|gnome-shell|kwin_wayland|sway|wayland|Xwayland) return 1 ;;
         chrome|firefox|brave|msedge|opera|browser|chromium) return 1 ;;
@@ -703,7 +735,6 @@ is_gaming_process() {
     esac
 
     # 2. UI/Utility Heuristics
-    local proc_args=$(ps -fp "$pid" -o args= 2>/dev/null)
     if echo "$proc_args" | grep -qiE -- "--type=(zygote|renderer|gpu-process|utility|extension-process|worker-process)"; then
         return 1
     fi
@@ -722,14 +753,24 @@ is_gaming_process() {
     fi
 
     # 5. Parent Process Check
-    local ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
     for i in {1..3}; do
         [ -z "$ppid" ] || [ "$ppid" -lt 10 ] && break
-        local p_comm=$(ps -p "$ppid" -o comm= 2>/dev/null)
+        
+        local p_cached_info="${BatchedProcInfoMap[$ppid]}"
+        local p_comm=""
+        local next_ppid=""
+
+        if [ -n "$p_cached_info" ]; then
+            IFS='|' read -r next_ppid p_comm _ <<< "$p_cached_info"
+        else
+            p_comm=$(ps -p "$ppid" -o comm= 2>/dev/null)
+            next_ppid=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ')
+        fi
+
         case "$p_comm" in
             steam|lutris|heroic|wine|wineserver) return 0 ;;
         esac
-        ppid=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ')
+        ppid="$next_ppid"
     done
 
     return 1
@@ -1120,8 +1161,18 @@ migrate_process_memory() {
 # Standardizes process information extraction
 get_proc_info() {
     local pid="$1"
-    local proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
-    local full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
+    local cached_info="${BatchedProcInfoMap[$pid]}"
+    local proc_comm=""
+    local full_proc_cmd=""
+
+    if [ -n "$cached_info" ]; then
+        # cached_info is "ppid|comm|args"
+        IFS='|' read -r _ proc_comm full_proc_cmd <<< "$cached_info"
+    else
+        proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+        full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
+    fi
+
     [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
     local simplified_cmd=$(get_simplified_cmd "$pid" "$proc_comm" "$full_proc_cmd")
     local raw_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
@@ -1130,6 +1181,9 @@ get_proc_info() {
 
 # Main optimization loop: identifies GPU users and applies policies
 run_optimization() {
+    # Batch load process info to minimize forks in the loop
+    batch_load_proc_info
+
     # Cross-vendor PID detection (Render nodes and NVIDIA devices)
     local gpu_pids=$(fuser /dev/dri/renderD* /dev/nvidia* 2>/dev/null | tr ' ' '\n' | sort -u)
 
@@ -1295,6 +1349,12 @@ summarize_optimizations() {
         local sorted_pids=$(echo "${!OptimizedPidsMap[@]}" | tr ' ' '\n' | sort -n)
 
         for pid in $sorted_pids; do
+            # Batch load might be stale if we are in a long summary, but usually summary is fast.
+            # We ensure we have info for these PIDs.
+            if [ -z "${BatchedProcInfoMap[$pid]}" ]; then
+                 batch_load_proc_info
+            fi
+
             IFS='|' read -r proc_comm full_proc_cmd simplified_cmd raw_current_affinity <<< "$(get_proc_info "$pid")"
 
             # Load per-process configuration to find overrides for summary
