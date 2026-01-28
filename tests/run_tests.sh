@@ -73,6 +73,13 @@ assert_eq "0,1,2,3,6" "$(normalize_affinity "0-3,6")" "normalize_affinity basic"
 assert_eq "0,1,2,3" "$(normalize_affinity "0,1,2,3")" "normalize_affinity already normalized"
 assert_eq "0,1,2,3" "$(normalize_affinity "3,2,1,0")" "normalize_affinity sorting"
 
+# Test 1b: format_range
+assert_eq "1-5" "$(format_range "1,2,3,4,5")" "format_range simple sequence"
+assert_eq "1,2,5-7,9" "$(format_range "1,2,5,6,7,9")" "format_range mixed"
+assert_eq "1-3,5-7" "$(format_range "1,2,3,5,6,7")" "format_range two ranges"
+assert_eq "1,3,5" "$(format_range "5,1,3")" "format_range sorting and no ranges"
+assert_eq "1-3" "$(format_range "1,2,2,3")" "format_range deduplication"
+
 # Test 2: parse_args
 parse_args "-p" "--daemon" "-s" "1"
 assert_eq "false" "$UseHt" "parse_args --physical-only"

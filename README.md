@@ -195,6 +195,7 @@ If run as root, the script applies several system-level tweaks to reduce micro-s
 - **`kernel.nmi_watchdog=0`**: Disables the NMI watchdog to reduce periodic interrupts and improve latency consistency.
 - **Transparent Hugepages (THP)**: Set to `never` to prevent micro-stutters and stalls during dynamic allocation and defragmentation.
 - **CPU Scaling Governor**: Automatically sets all cores to `performance` mode to prevent downclocking during gameplay.
+- **IRQ Optimization**: Automatically pins GPU-associated interrupts to the local NUMA node's cores to minimize cross-node latency.
 - **PCIe Max Performance**: If enabled, sets the global PCIe ASPM policy to `performance` and disables Runtime Power Management and ASPM for the target GPU.
 
 ### 6. PCIe Health Monitoring

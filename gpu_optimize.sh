@@ -33,13 +33,14 @@ IncludeNearby=true           # If true, include "nearby" NUMA nodes in addition 
 MaxDist=11                   # Maximum distance value from 'numactl -H' to consider a node "nearby"
 OnlyGaming=true              # If true, only optimize processes identified as games or high-perf apps
 SkipSystemTune=false         # If true, do not attempt to modify sysctl or CPU governors
+OptimizeIrqs=true            # If true, pin GPU IRQs to the local NUMA node
 MaxPerf=false                # If true, force PCIe device and ASPM to maximum performance
 DryRun=false                 # If true, log intended changes but do not apply them
 DropPrivs=true               # If true, drop from root to the logged-in user after system tuning
 AutoGenConfig=true           # If true, create per-command default configuration files
 MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time optimization log
 GpuIndexArg=0                # Default GPU index
-SystemConfig="/etc/gpu-numa-tune.conf"
+SystemConfig=${MOCK_CONFIG:-"/etc/gpu-numa-tune.conf"}
 LocalConfigPath=".config/gpu-numa-tune"
 
 # Load configuration from files
@@ -81,6 +82,7 @@ parse_config_file() {
             IncludeNearby) IncludeNearby="$value" ;;
             MaxDist) MaxDist="$value" ;;
             OnlyGaming) OnlyGaming="$value" ;;
+            OptimizeIrqs) OptimizeIrqs="$value" ;;
             SkipSystemTune) SkipSystemTune="$value" ;;
             MaxPerf) MaxPerf="$value" ;;
             DryRun) DryRun="$value" ;;
@@ -239,6 +241,7 @@ usage() {
     echo "  -l, --local-only     Use only the GPU's local NUMA node (ignore nearby nodes)"
     echo "  -a, --all-gpu-procs  Optimize ALL processes using the GPU (not just games)"
     echo "  -x, --no-tune        Skip system-level tuning (sysctl, etc.)"
+    echo "  --no-irq             Skip GPU IRQ optimization"
     echo "  -f, --max-perf       Force max PCIe performance (disable ASPM/Runtime PM)"
     echo "  -n, --dry-run        Dry-run mode (don't apply any changes)"
     echo "  -c, --no-config      Do not automatically create per-command local configs"
@@ -455,6 +458,32 @@ get_nearby_nodes() {
     echo "$target_node"
 }
 
+# Returns a space-separated list of IRQs associated with the detected GPU
+get_gpu_irqs() {
+    local irqs=()
+    local device_sys_dir="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr"
+
+    # 1. Primary IRQ
+    if [ -f "$device_sys_dir/irq" ]; then
+        local primary_irq=$(cat "$device_sys_dir/irq")
+        [ "$primary_irq" -gt 0 ] && irqs+=("$primary_irq")
+    fi
+
+    # 2. MSI/MSI-X IRQs
+    if [ -d "$device_sys_dir/msi_irqs" ]; then
+        for irq in "$device_sys_dir/msi_irqs/"*; do
+            [ -e "$irq" ] || continue
+            local b_irq=$(basename "$irq")
+            [[ "$b_irq" =~ ^[0-9]+$ ]] && irqs+=("$b_irq")
+        done
+    fi
+
+    # Deduplicate and return
+    local result=$(echo "${irqs[@]}" | tr ' ' '\n' | sort -un | xargs echo)
+    [ -n "$DEBUG" ] && echo "DEBUG: get_gpu_irqs found: $result" >&2
+    echo "$result"
+}
+
 # Combines CPU lists from multiple NUMA nodes
 get_nodes_cpulist() {
     local nodes=$1
@@ -515,6 +544,54 @@ detect_target_user() {
 }
 
 # --- CPU & Affinity Management ---
+
+# Formats a list of numbers into sorted ranges (e.g., 1,2,3,5,6 -> 1-3,5-6)
+format_range() {
+    local input="$1"
+    [ -z "$input" ] && return
+    
+    local sorted_nums
+    sorted_nums=$(echo "$input" | tr ',' '\n' | sort -n | uniq | xargs echo)
+    [ -z "$sorted_nums" ] && return
+
+    local result=""
+    local range_start=""
+    local prev_num=""
+    
+    read -ra nums <<< "$sorted_nums"
+    for num in "${nums[@]}"; do
+        if [ -z "$prev_num" ]; then
+            range_start="$num"
+            prev_num="$num"
+            continue
+        fi
+        
+        if [ "$num" -eq "$((prev_num + 1))" ]; then
+            prev_num="$num"
+        else
+            if [ "$range_start" -eq "$prev_num" ]; then
+                result+="${range_start},"
+            elif [ "$((range_start + 1))" -eq "$prev_num" ]; then
+                result+="${range_start},${prev_num},"
+            else
+                result+="${range_start}-${prev_num},"
+            fi
+            range_start="$num"
+            prev_num="$num"
+        fi
+    done
+    
+    # Add last group
+    if [ "$range_start" -eq "$prev_num" ]; then
+        result+="${range_start}"
+    elif [ "$((range_start + 1))" -eq "$prev_num" ]; then
+        result+="${range_start},${prev_num}"
+    else
+        result+="${range_start}-${prev_num}"
+    fi
+    
+    echo "$result"
+}
 
 # Converts CPU list (e.g., 0-3,6) to a sorted, unique, comma-separated list
 normalize_affinity() {
@@ -666,16 +743,26 @@ persist_original_value() {
     local value="$2"
 
     [ -z "$SystemConfig" ] && return
-    [ ! -w "$(dirname "$SystemConfig")" ] && return
+    
+    # Check if key already exists in the config file
+    if [ -f "$SystemConfig" ] && grep -qE "^[[:space:]]*${key}=" "$SystemConfig"; then
+        return
+    fi
+
+    # Create directory if it doesn't exist
+    local config_dir=$(dirname "$SystemConfig")
+    if [ ! -d "$config_dir" ]; then
+        if [ "$DryRun" = false ]; then
+            mkdir -p "$config_dir" 2>/dev/null || return
+        else
+            return
+        fi
+    fi
+    [ ! -w "$config_dir" ] && return
 
     # Extract the active value enclosed in brackets if present (e.g., for THP)
     if [[ "$value" =~ \[([^\]]+)\] ]]; then
         value="${BASH_REMATCH[1]}"
-    fi
-
-    # Check if key already exists in the config file
-    if [ -f "$SystemConfig" ] && grep -qE "^[[:space:]]*${key}=" "$SystemConfig"; then
-        return
     fi
 
     # Append the key=value pair to the config file
@@ -767,6 +854,48 @@ system_manage_settings() {
         fi
     }
 
+    # Helper for IRQ affinity
+    manage_irq_affinity() {
+        [ "$OptimizeIrqs" != true ] && return 0
+
+        local tuned_irqs=()
+        local failed_irqs=()
+        local dry_irqs=()
+
+        for irq in $(get_gpu_irqs); do
+            local key="irq_${irq}_affinity"
+            local affinity_file="$PROC_PREFIX/proc/irq/$irq/smp_affinity_list"
+            [ -f "$affinity_file" ] || continue
+
+            if [ "$DryRun" = false ]; then
+                if echo "$TargetNormalizedMask" > "$affinity_file" 2>/dev/null; then
+                    tuned_irqs+=("$irq")
+                else
+                    failed_irqs+=("$irq")
+                fi
+            else
+                dry_irqs+=("$irq")
+            fi
+        done
+
+        if [ "$SystemTuned" == "" ]; then
+            if [ ${#tuned_irqs[@]} -gt 0 ]; then
+                local irq_list=$(format_range "$(echo "${tuned_irqs[@]}" | tr ' ' ',')")
+                local label="IRQ Affinity"
+                [ "$action" = "restore" ] && label="IRQ Restore"
+                printf "  [OK] %-30s -> %-10s (%s)\n" "IRQs Optimized" "$irq_list" "$label"
+            fi
+            if [ ${#failed_irqs[@]} -gt 0 ]; then
+                local irq_list=$(format_range "$(echo "${failed_irqs[@]}" | tr ' ' ',')")
+                printf "  [FAIL] %-28s -> %-10s (%s)\n" "IRQs Failed" "$irq_list" "IRQ Affinity"
+            fi
+            if [ ${#dry_irqs[@]} -gt 0 ]; then
+                local irq_list=$(format_range "$(echo "${dry_irqs[@]}" | tr ' ' ',')")
+                printf "  [DRY] %-29s -> %-10s (%s)\n" "IRQs Optimized" "$irq_list" "IRQ Affinity"
+            fi
+        fi
+    }
+
     # Apply/Restore Sysctl Settings
     manage_sysctl "vm.max_map_count" "2147483647" "Memory Mapping"
     manage_sysctl "kernel.numa_balancing" "0" "NUMA Contention"
@@ -777,6 +906,7 @@ system_manage_settings() {
     manage_sysctl "net.core.busy_poll" "50" "Network Latency"
     manage_sysctl "vm.stat_interval" "10" "Jitter Reduction"
     manage_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
+    manage_irq_affinity
 
     # PCIe Max Performance
     if [ "$MaxPerf" = true ] || [ "$action" = "restore" ]; then
@@ -1235,6 +1365,7 @@ parse_args() {
             -l|--local-only) IncludeNearby=false; shift ;;
             -a|--all-gpu-procs) OnlyGaming=false; shift ;;
             -x|--no-tune) SkipSystemTune=true; shift ;;
+            --no-irq) OptimizeIrqs=false; shift ;;
             -f|--max-perf) MaxPerf=true; shift ;;
             -n|--dry-run) DryRun=true; shift ;;
             -c|--no-config) AutoGenConfig=false; shift ;;
@@ -1321,8 +1452,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     # Parse CLI arguments (they override configuration files)
     parse_args "$@"
     check_dependencies
-    system_manage_settings "tune"
     detect_target_user
+    detect_gpu
+    discover_resources
+    filter_cpus
+    system_manage_settings "tune"
 
     # Root-privileged parent loop
     if [ "$DropPrivs" = true ] && [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
@@ -1389,9 +1523,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     # Everything below runs either as root (if DropPrivs=false)
     # or as the target user (if DropPrivs=true, in the child process).
 
-    detect_gpu
-    discover_resources
-    filter_cpus
     load_all_time_stats
 
     # Capture global configuration baseline for override detection

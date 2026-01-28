@@ -62,6 +62,9 @@ if [ ! -f "$INSTALL_CONFIG_PATH" ]; then
 # true = use 'membind' (fails if node full), false = use 'preferred'
 #StrictMem=false
 
+# Pin GPU IRQs to the local NUMA node (true/false)
+#OptimizeIrqs=true
+
 # Include "nearby" NUMA nodes in addition to the closest one (true/false)
 #IncludeNearby=true
 
