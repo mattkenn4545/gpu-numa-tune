@@ -212,7 +212,7 @@ status_log() {
 
         # Print table header
         echo "--------------------------------------------------------------------------------------------------------------------------------"
-        status_log "PID" "EXE" "CMD" "ORIG AFFINITY" "STATUS" "OVERRIDES"
+        status_log "PID" "EXE" "CMD" "AFFINITY" "STATUS" "OVERRIDES"
         echo "--------------------------------------------------------------------------------------------------------------------------------"
     fi
 
@@ -1127,19 +1127,6 @@ get_proc_info() {
     echo "$proc_comm|$full_proc_cmd|$simplified_cmd|$raw_affinity"
 }
 
-# Standardizes log formatting for process status
-# Used during active optimization and periodic summaries
-print_status_row() {
-    local pid="$1"
-    local comm="$2"
-    local simplified="$3"
-    local affinity="$4"
-    local status="$5"
-    local overrides="$6"
-
-    status_log "$pid" "$comm" "$simplified" "$affinity" "$status" "$overrides"
-}
-
 # Main optimization loop: identifies GPU users and applies policies
 run_optimization() {
     # Cross-vendor PID detection (Render nodes and NVIDIA devices)
@@ -1193,7 +1180,7 @@ run_optimization() {
 
         if [ "$current_normalized_mask" != "$l_TargetNormalizedMask" ]; then
             # Optimization required
-            apply_process_policies "$pid" "$l_FinalCpuMask" "$l_NearbyNodeIds" "$l_NumaNodeId" "$l_StrictMem"
+            apply_process_policies "$pid" "$l_TargetNormalizedMask" "$l_NearbyNodeIds" "$l_NumaNodeId" "$l_StrictMem"
 
             local process_rss_kb=$(awk '/VmRSS/ {print $2}' "$PROC_PREFIX/proc/$pid/status" 2>/dev/null || echo 0)
             local target_nodes="${l_NearbyNodeIds:-$l_NumaNodeId}"
@@ -1213,7 +1200,7 @@ run_optimization() {
 
             # Queue for notification
             PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|$target_nodes|$process_rss_kb")
-            print_status_row "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "$status_msg" "$overrides"
+            status_log "$pid" "$proc_comm" "$simplified_cmd" "$(format_range "$l_TargetNormalizedMask")" "$status_msg" "$overrides"
 
             if [ -z "${OptimizedPidsMap[$pid]}" ]; then
                 ((TotalOptimizedCount++))
@@ -1238,7 +1225,7 @@ run_optimization() {
                 # Already optimized but not yet tracked in this session
                 local status_msg="OPTIMIZED"
                 [ "$DryRun" = true ] && status_msg="DRY RUN ($status_msg)"
-                print_status_row "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "$status_msg" "$overrides"
+                status_log "$pid" "$proc_comm" "$simplified_cmd" "$(format_range "$l_TargetNormalizedMask")" "$status_msg" "$overrides"
                 OptimizedPidsMap[$pid]=$(date +%s)
                 LastOptimizationTime=$(date +%s)
                 SummarySilenced=false
@@ -1311,7 +1298,7 @@ summarize_optimizations() {
                 get_overrides "$GlobalUseHt" "$GlobalIncludeNearby" "$GlobalMaxDist" "$GlobalStrictMem"
             )
 
-            print_status_row "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$overrides"
+            status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$overrides"
         done
 
         LastSummaryTime=$now
