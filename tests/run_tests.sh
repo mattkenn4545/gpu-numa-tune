@@ -515,7 +515,40 @@ DropPrivs=false
 AutoGenConfig=false
 MaxAllTimeLogLines=5000
 GpuIndex=2
+ReniceValue=-5
+IoniceValue=idle
 EOF
+
+# Test 13.1: create_process_config content
+echo "Test 13.1: create_process_config content"
+LocalConfigPath="tests/mock_local_config"
+mkdir -p "$LocalConfigPath"
+# Set globals to specific values
+GlobalUseHt=true
+GlobalIncludeNearby=true
+GlobalMaxDist=10
+GlobalStrictMem=false
+GlobalReniceValue="-15"
+GlobalIoniceValue="realtime:3"
+DryRun=false
+TargetUser="" # Use current user home
+
+create_process_config "test_app"
+config_file="${HOME}/${LocalConfigPath}/test_app.conf"
+
+if [ -f "$config_file" ]; then
+    content=$(cat "$config_file")
+    grep -q "UseHt=true" <<< "$content" && assert_eq "0" "$?" "create_process_config UseHt"
+    grep -q "IncludeNearby=true" <<< "$content" && assert_eq "0" "$?" "create_process_config IncludeNearby"
+    grep -q "MaxDist=10" <<< "$content" && assert_eq "0" "$?" "create_process_config MaxDist"
+    grep -q "StrictMem=false" <<< "$content" && assert_eq "0" "$?" "create_process_config StrictMem"
+    grep -q "ReniceValue=-15" <<< "$content" && assert_eq "0" "$?" "create_process_config ReniceValue"
+    grep -q "IoniceValue=realtime:3" <<< "$content" && assert_eq "0" "$?" "create_process_config IoniceValue"
+else
+    echo -e "${RED}[FAIL]${NC} create_process_config: config file not created"
+    FAILED=$((FAILED + 1))
+fi
+rm -rf "$LocalConfigPath"
 
 # Redefine load_config to use our mock etc path
 # Actually we can just override the config_files array if it wasn't local to the function, 

@@ -34,10 +34,12 @@ MaxDist=11                   # Maximum distance value from 'numactl -H' to consi
 OnlyGaming=true              # If true, only optimize processes identified as games or high-perf apps
 SkipSystemTune=false         # If true, do not attempt to modify sysctl or CPU governors
 OptimizeIrqs=true            # If true, pin GPU IRQs to the local NUMA node
-MaxPerf=false                # If true, force PCIe device and ASPM to maximum performance
+MaxPerf=true                 # If true, force PCIe device and ASPM to maximum performance
 DryRun=false                 # If true, log intended changes but do not apply them
 DropPrivs=true               # If true, drop from root to the logged-in user after system tuning
 AutoGenConfig=true           # If true, create per-command default configuration files
+ReniceValue="-10"            # Nice value for optimized processes (-20 to 19, "" to skip)
+IoniceValue="best-effort:0"  # Ionice class/value (e.g., "best-effort:0", "" to skip)
 MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time optimization log
 GpuIndexArg=0                # Default GPU index
 SystemConfig=${MOCK_CONFIG:-"/etc/gpu-numa-tune.conf"}
@@ -88,6 +90,8 @@ parse_config_file() {
             DryRun) DryRun="$value" ;;
             DropPrivs) DropPrivs="$value" ;;
             AutoGenConfig) AutoGenConfig="$value" ;;
+            ReniceValue) ReniceValue="$value" ;;
+            IoniceValue) IoniceValue="$value" ;;
             MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
             GpuIndex) GpuIndexArg="$value" ;;
             SummaryInterval) SummaryInterval="$value" ;;
@@ -152,6 +156,8 @@ UseHt=${GlobalUseHt:-$UseHt}
 IncludeNearby=${GlobalIncludeNearby:-$IncludeNearby}
 MaxDist=${GlobalMaxDist:-$MaxDist}
 StrictMem=${GlobalStrictMem:-$StrictMem}
+ReniceValue=${GlobalReniceValue:-$ReniceValue}
+IoniceValue=${GlobalIoniceValue:-$IoniceValue}
 EOF
             # If we're root but target user exists, ensure they own the file
             if [ "$EUID" -eq 0 ] && [ -n "$TargetUser" ]; then
@@ -675,12 +681,16 @@ get_overrides() {
     local old_nearby="$2"
     local old_dist="$3"
     local old_strict="$4"
+    local old_renice="$5"
+    local old_ionice="$6"
 
     local overrides=""
     [ "$UseHt" != "$old_ht" ] && overrides+="UseHt=$UseHt,"
     [ "$IncludeNearby" != "$old_nearby" ] && overrides+="IncludeNearby=$IncludeNearby,"
     [ "$MaxDist" != "$old_dist" ] && overrides+="MaxDist=$MaxDist,"
     [ "$StrictMem" != "$old_strict" ] && overrides+="StrictMem=$StrictMem,"
+    [ "$ReniceValue" != "$old_renice" ] && overrides+="ReniceValue=$ReniceValue,"
+    [ "$IoniceValue" != "$old_ionice" ] && overrides+="IoniceValue=$IoniceValue,"
     echo "${overrides%,}"
 }
 
@@ -1116,13 +1126,15 @@ trigger_system_management() {
 
 # --- Core Logic & Execution ---
 
-# Applies affinity and memory policies to a PID
+# Applies affinity, memory policies, and priority to a PID
 apply_process_policies() {
     local pid="$1"
     local final_cpu_mask="$2"
     local nearby_nodes="$3"
     local numa_node_id="$4"
     local strict_mem="$5"
+    local renice_val="$6"
+    local ionice_val="$7"
 
     [ "$DryRun" = true ] && return 0
 
@@ -1141,6 +1153,30 @@ apply_process_policies() {
             fi
         else
             numactl --preferred="$target_nodes" -p "$pid" > /dev/null 2>&1
+        fi
+    fi
+
+    # 3. Process Priority (Renice)
+    if [ -n "$renice_val" ]; then
+        renice -n "$renice_val" -p "$pid" > /dev/null 2>&1
+    fi
+
+    # 4. IO Priority (Ionice)
+    if [ -n "$ionice_val" ]; then
+        if [[ "$ionice_val" == *":"* ]]; then
+            local class="${ionice_val%%:*}"
+            local classdata="${ionice_val##*:}"
+            case "$class" in
+                idle) ionice -c 3 -p "$pid" > /dev/null 2>&1 ;;
+                best-effort) ionice -c 2 -n "$classdata" -p "$pid" > /dev/null 2>&1 ;;
+                realtime) ionice -c 1 -n "$classdata" -p "$pid" > /dev/null 2>&1 ;;
+            esac
+        else
+            case "$ionice_val" in
+                idle) ionice -c 3 -p "$pid" > /dev/null 2>&1 ;;
+                best-effort) ionice -c 2 -p "$pid" > /dev/null 2>&1 ;;
+                realtime) ionice -c 1 -p "$pid" > /dev/null 2>&1 ;;
+            esac
         fi
     fi
 }
@@ -1240,6 +1276,8 @@ run_optimization() {
             local l_NearbyNodeIds="$NearbyNodeIds"
             local l_NumaNodeId="$NumaNodeId"
             local l_StrictMem="$StrictMem"
+            local l_ReniceValue="$ReniceValue"
+            local l_IoniceValue="$IoniceValue"
 
             if [ "$UseHt" != "$GlobalUseHt" ] || [ "$IncludeNearby" != "$GlobalIncludeNearby" ] || [ "$MaxDist" != "$GlobalMaxDist" ]; then
                 # Recalculate resources if per-process config differs from global hardware discovery
@@ -1251,18 +1289,18 @@ run_optimization() {
                 l_NumaNodeId="$NumaNodeId"
             fi
 
-            local overrides=$(get_overrides "$GlobalUseHt" "$GlobalIncludeNearby" "$GlobalMaxDist" "$GlobalStrictMem")
-            echo "$l_FinalCpuMask|$l_TargetNormalizedMask|$l_NearbyNodeIds|$l_NumaNodeId|$l_StrictMem|$overrides"
+            local overrides=$(get_overrides "$GlobalUseHt" "$GlobalIncludeNearby" "$GlobalMaxDist" "$GlobalStrictMem" "$GlobalReniceValue" "$GlobalIoniceValue")
+            echo "$l_FinalCpuMask|$l_TargetNormalizedMask|$l_NearbyNodeIds|$l_NumaNodeId|$l_StrictMem|$l_ReniceValue|$l_IoniceValue|$overrides"
         )
 
-        IFS='|' read -r l_FinalCpuMask l_TargetNormalizedMask l_NearbyNodeIds l_NumaNodeId l_StrictMem overrides <<< "$proc_settings"
+        IFS='|' read -r l_FinalCpuMask l_TargetNormalizedMask l_NearbyNodeIds l_NumaNodeId l_StrictMem l_ReniceValue l_IoniceValue overrides <<< "$proc_settings"
 
         [ -z "$raw_current_affinity" ] && continue
         local current_normalized_mask=$(normalize_affinity "$raw_current_affinity")
 
         if [ "$current_normalized_mask" != "$l_TargetNormalizedMask" ]; then
             # Optimization required
-            apply_process_policies "$pid" "$l_TargetNormalizedMask" "$l_NearbyNodeIds" "$l_NumaNodeId" "$l_StrictMem"
+            apply_process_policies "$pid" "$l_TargetNormalizedMask" "$l_NearbyNodeIds" "$l_NumaNodeId" "$l_StrictMem" "$l_ReniceValue" "$l_IoniceValue"
 
             local process_rss_kb=$(awk '/VmRSS/ {print $2}' "$PROC_PREFIX/proc/$pid/status" 2>/dev/null || echo 0)
             local target_nodes="${l_NearbyNodeIds:-$l_NumaNodeId}"
@@ -1278,6 +1316,15 @@ run_optimization() {
 
             if [ "$DryRun" = true ]; then
                 [[ "$status_msg" == *"MOVED"* ]] && status_msg="WOULD MOVE" || status_msg="DRY RUN ($status_msg)"
+            fi
+
+            # Check if affinity already matches
+            if [ "$current_normalized_mask" = "$l_TargetNormalizedMask" ]; then
+                # Even if affinity matches, we might want to ensure priority/ionice are set
+                # But to avoid overhead in the daemon loop, we only do this once
+                if [ -z "${OptimizedPidsMap[$pid]}" ]; then
+                     apply_process_policies "$pid" "$l_TargetNormalizedMask" "$l_NearbyNodeIds" "$l_NumaNodeId" "$l_StrictMem" "$l_ReniceValue" "$l_IoniceValue"
+                fi
             fi
 
             # Queue for notification
@@ -1387,7 +1434,7 @@ summarize_optimizations() {
             # Load per-process configuration to find overrides for summary
             local overrides=$(
                 load_process_config "$simplified_cmd"
-                get_overrides "$GlobalUseHt" "$GlobalIncludeNearby" "$GlobalMaxDist" "$GlobalStrictMem"
+                get_overrides "$GlobalUseHt" "$GlobalIncludeNearby" "$GlobalMaxDist" "$GlobalStrictMem" "$GlobalReniceValue" "$GlobalIoniceValue"
             )
 
             status_log "$pid" "$proc_comm" "$simplified_cmd" "$raw_current_affinity" "OPTIMIZED $(date -d "@${OptimizedPidsMap[$pid]}" "+%H:%M %D")" "$overrides"
@@ -1609,6 +1656,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     GlobalIncludeNearby="$IncludeNearby"
     GlobalMaxDist="$MaxDist"
     GlobalStrictMem="$StrictMem"
+    GlobalReniceValue="$ReniceValue"
+    GlobalIoniceValue="$IoniceValue"
 
     # Setup signal handlers for cleanup
     trap 'trigger_system_management "restore"; exit 0' TERM INT QUIT

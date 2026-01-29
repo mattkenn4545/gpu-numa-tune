@@ -19,10 +19,12 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **🛡️ Cross-Vendor Support:** Seamlessly works with NVIDIA, AMD, and Intel GPUs.
 - **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes. Summaries are automatically silenced after 2 hours of inactivity to keep your logs clean, and will resume once a qualifying process is detected.
 - **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
+- **⚖️ Priority Management:** Gives games higher CPU (`renice`) and IO (`ionice`) priority to ensure they aren't throttled by background tasks.
 - **🧬 Nearby Node Support:** If the local node is full, it intelligently expands to the next closest nodes based on hardware distance.
-- **⚙️ Per-Process Configuration:** Fine-tune settings like HT usage or memory locality for specific games using dedicated `.conf` files (e.g., `Cyberpunk2077.exe.conf`).
+- **⚙️ Per-Process Configuration:** Fine-tune settings like HT usage, memory locality, or process priority for specific games using dedicated `.conf` files (e.g., `Cyberpunk2077.exe.conf`).
 - **📈 All-Time Tracking:** Maintains a persistent log of every optimization across reboots, providing historical insights into your system's performance tuning.
 - **📊 Real-time Monitoring:** Periodically summarizes active optimizations and cleans up dead processes from tracking, with automatic silencing during periods of inactivity.
+- **🛠️ Auto-Config Generation:** Automatically creates template configuration files for detected games, making it easy to customize per-process settings like priority and affinity.
 
 ---
 
@@ -75,7 +77,9 @@ You can also create process-specific configuration files. The optimizer looks fo
 2.  `~/.config/gpu-numa-tune/`
 3.  The current working directory of the script.
 
-These per-process configs can override settings like `UseHt`, `IncludeNearby`, `MaxDist`, and `StrictMem` for that specific game without affecting global behavior.
+These per-process configs can override settings like `UseHt`, `IncludeNearby`, `MaxDist`, `StrictMem`, `ReniceValue`, and `IoniceValue` for that specific game without affecting global behavior.
+
+When a new process is optimized, the script automatically creates a template configuration file in your user config directory (if `AutoGenConfig=true`), populated with the current global defaults.
 
 **Note:** Command-line options always take precedence over configuration file values.
 
@@ -101,7 +105,9 @@ GpuIndex=0
 | `IncludeNearby` | Include "nearby" NUMA nodes based on distance | `true` |
 | `MaxDist` | Max distance from `numactl -H` for "nearby" nodes | `11` |
 | `OnlyGaming` | Only optimize games and high-perf apps | `true` |
-| `MaxPerf` | Force max PCIe performance (disable ASPM/Runtime PM) | `false` |
+| `MaxPerf` | Force max PCIe performance (disable ASPM/Runtime PM) | `true` |
+| `ReniceValue` | Nice value for optimized processes (-20 to 19, "" to skip) | `-10` |
+| `IoniceValue` | Ionice class/value (e.g., "best-effort:0", "" to skip) | `best-effort:0` |
 | `SkipSystemTune` | Skip modifying `sysctl` or CPU governors | `false` |
 | `DryRun` | Log intended changes without applying them | `false` |
 | `DropPrivs` | Drop root privileges after system tuning | `true` |
@@ -171,11 +177,13 @@ Unlike blind optimizers, this script uses surgical precision to find games:
     - Checks process lineage to catch child processes spawned by game launchers.
     - Filters out common non-gaming applications (browsers, Discord, etc.) and background services.
 
-### 3. Execution & Memory Optimization
-Once a game is identified, the script applies three distinct optimizations:
+### 3. Execution, Memory & Priority Optimization
+Once a game is identified, the script applies several distinct optimizations:
 - **CPU Pinning (`taskset`)**: Forces the game threads to run *only* on the CPU cores physically wired to the GPU's PCI-E lanes. This eliminates "hop" latency across the Infinity Fabric or QPI/UPI.
 - **Memory Policy (`numactl`)**: Sets the process's memory allocation policy to `preferred` (or `strict` with `--strict`) for the target NUMA nodes.
 - **Live Migration (`migratepages`)**: Moves existing memory pages from "slow" remote nodes to the "fast" local node in real-time without restarting the game.
+- **CPU Priority (`renice`)**: Boosts the process's scheduling priority (default nice value: `-10`) to ensure it gets preferential treatment by the kernel scheduler.
+- **IO Priority (`ionice`)**: Sets the process's IO scheduling class and priority (default: `best-effort:0`) to reduce disk latency and prevent background tasks from stalling game assets loading.
 
 ### 4. Privilege Management & Security
 To ensure maximum performance while maintaining security, the script handles privileges intelligently:
