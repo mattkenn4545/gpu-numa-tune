@@ -78,7 +78,7 @@ if [ ! -f "$INSTALL_CONFIG_PATH" ]; then
 #SkipSystemTune=false
 
 # Force max PCIe performance (disable ASPM/Runtime PM) (true/false)
-#MaxPerf=false
+#MaxPerf=true
 
 # Dry-run mode (true/false)
 #DryRun=false
@@ -100,6 +100,9 @@ if [ ! -f "$INSTALL_CONFIG_PATH" ]; then
 
 # Number of log lines before repeating the table header
 #HeaderInterval=20
+
+# Create per-command default configuration files
+#AutoGenConfig=true
 
 # SystemTune Original values
 EOF

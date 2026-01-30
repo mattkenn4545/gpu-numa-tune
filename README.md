@@ -113,6 +113,7 @@ GpuIndex=0
 | `DropPrivs` | Drop root privileges after system tuning | `true` |
 | `AutoGenConfig` | Create per-command default configuration files | `true` |
 | `MaxAllTimeLogLines` | Max lines to keep in `~/.gpu_numa_optimizations` | `10000` |
+| `OptimizeIrqs` | Pin GPU interrupts to local NUMA node (`true`/`false`) | `true` |
 | `GpuIndex` | Default GPU index to target | `0` |
 | `SummaryInterval` | Interval between periodic summary reports (seconds) | `1800` |
 | `SummarySilenceTimeout` | Stop summaries after inactivity (seconds) | `7200` |
@@ -132,9 +133,11 @@ While the configuration file is recommended for persistent settings, you can ove
 - `-l, --local-only`: Use only local node (sets `IncludeNearby=false`).
 - `-a, --all-gpu-procs`: Optimize all GPU processes (sets `OnlyGaming=false`).
 - `-f, --max-perf`: Force maximum PCIe performance (sets `MaxPerf=true`).
+- `--no-irq`: Skip pinning GPU interrupts to the local NUMA node (sets `OptimizeIrqs=false`).
 - `-x, --no-tune`: Skip system-level kernel tuning (sets `SkipSystemTune=true`).
 - `-n, --dry-run`: Dry-run mode (sets `DryRun=true`).
 - `-m, --max-log-lines`: Set max log lines (sets `MaxAllTimeLogLines`).
+- `-c, --no-config`: Disable automatic configuration file generation (sets `AutoGenConfig=false`).
 - `-k, --no-drop`: Do not drop root privileges (sets `DropPrivs=false`).
 - `-h, --help`: Show full usage information.
 

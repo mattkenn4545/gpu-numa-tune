@@ -87,12 +87,13 @@ assert_eq "true" "$DaemonMode" "parse_args --daemon"
 assert_eq "true" "$StrictMem" "parse_args --strict"
 assert_eq "1" "$GpuIndexArg" "parse_args GpuIndexArg"
 
-parse_args "-l" "-a" "-x" "-k" "-c" "--comm-pipe" "/tmp/pipe"
+parse_args "-l" "-a" "-x" "-k" "-c" "--no-irq" "--comm-pipe" "/tmp/pipe"
 assert_eq "false" "$IncludeNearby" "parse_args --local-only"
 assert_eq "false" "$OnlyGaming" "parse_args --all-gpu-procs"
 assert_eq "true" "$SkipSystemTune" "parse_args --no-tune"
 assert_eq "false" "$DropPrivs" "parse_args --no-drop"
 assert_eq "false" "$AutoGenConfig" "parse_args --no-config"
+assert_eq "false" "$OptimizeIrqs" "parse_args --no-irq"
 assert_eq "/tmp/pipe" "$CommPipe" "parse_args --comm-pipe"
 
 # Test 3: is_gaming_process (mocking ps and /proc)
@@ -517,6 +518,11 @@ MaxAllTimeLogLines=5000
 GpuIndex=2
 ReniceValue=-5
 IoniceValue=idle
+OptimizeIrqs=false
+SummaryInterval=3600
+SummarySilenceTimeout=14400
+HeaderInterval=50
+CommPipe=/tmp/testpipe
 EOF
 
 # Test 13.1: create_process_config content
@@ -578,6 +584,11 @@ load_config() {
                     MaxAllTimeLogLines) MaxAllTimeLogLines="$value" ;;
                     AutoGenConfig) AutoGenConfig="$value" ;;
                     GpuIndex) GpuIndexArg="$value" ;;
+                    OptimizeIrqs) OptimizeIrqs="$value" ;;
+                    SummaryInterval) SummaryInterval="$value" ;;
+                    SummarySilenceTimeout) SummarySilenceTimeout="$value" ;;
+                    HeaderInterval) HeaderInterval="$value" ;;
+                    CommPipe) CommPipe="$value" ;;
                 esac
             done < "$file"
         fi
@@ -598,6 +609,11 @@ assert_eq "false" "$DropPrivs" "Config: DropPrivs"
 assert_eq "5000" "$MaxAllTimeLogLines" "Config: MaxAllTimeLogLines"
 assert_eq "false" "$AutoGenConfig" "Config: AutoGenConfig"
 assert_eq "2" "$GpuIndexArg" "Config: GpuIndex"
+assert_eq "false" "$OptimizeIrqs" "Config: OptimizeIrqs"
+assert_eq "3600" "$SummaryInterval" "Config: SummaryInterval"
+assert_eq "14400" "$SummarySilenceTimeout" "Config: SummarySilenceTimeout"
+assert_eq "50" "$HeaderInterval" "Config: HeaderInterval"
+assert_eq "/tmp/testpipe" "$CommPipe" "Config: CommPipe"
 
 # Test 14: CLI overrides Config
 echo "Test 14: CLI overrides Config"
