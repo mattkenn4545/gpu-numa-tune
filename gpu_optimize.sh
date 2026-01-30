@@ -1182,22 +1182,48 @@ apply_process_policies() {
 }
 
 # Attempts to migrate memory pages of a process to the target nodes
+# Returns:
+# 0 = Success (Moved)
+# 1 = Invalid target
+# 2 = Migration command failed
+# 3 = Target node full (Not enough free RAM)
+# 5 = Process too old (Skipped to prevent late-game stutter)
 migrate_process_memory() {
     local pid="$1"
     local target_nodes="$2"
     local rss_kb="$3"
+    # Safety buffer to ensure we don't fill the node completely (default 512MB)
     local safety_margin_kb="${4:-524288}"
+
+    # --- CONFIGURATION ---
+    # Max age in seconds (120s = 2 minutes).
+    # If a process has been running longer than this, we assume gameplay
+    # has started and migration would cause unacceptable stutter.
+    local max_migration_age=120
+    # ---------------------
 
     [[ "$target_nodes" == "-1" || -z "$target_nodes" ]] && return 1
 
-    # Determine memory availability on target nodes
+    # 1. Process Age Check
+    # ps -o etimes gives elapsed time in seconds since the process started
+    local proc_age=$(ps -p "$pid" -o etimes= 2>/dev/null | tr -d ' ')
+
+    # Verify we got a valid integer
+    if [[ "$proc_age" =~ ^[0-9]+$ ]]; then
+        if [ "$proc_age" -gt "$max_migration_age" ]; then
+            # Return code 5: Process is too old to safely migrate
+            return 5
+        fi
+    fi
+
+    # 2. Free Memory Check
     local free_kb=0
     IFS=',' read -ra node_list <<< "$target_nodes"
     for node in "${node_list[@]}"; do
         free_kb=$((free_kb + $(get_node_free_kb "$node")))
     done
 
-    # Only migrate if there's enough free memory
+    # Only migrate if there's enough free memory (RSS + Safety Margin)
     if [ "$free_kb" -gt $((rss_kb + safety_margin_kb)) ]; then
         if [ "$DryRun" = false ]; then
             if migratepages "$pid" all "$target_nodes" > /dev/null 2>&1; then
@@ -1314,6 +1340,7 @@ run_optimization() {
                 local m_res=$?
                 [ "$m_res" -eq 2 ] && status_msg="OPTIMIZED (MOVE FAILED)"
                 [ "$m_res" -eq 3 ] && status_msg="OPTIMIZED (NODE FULL)"
+                [ "$m_res" -eq 5 ] && status_msg="OPTIMIZED (CPU ONLY - AGED PROCESS)"
             fi
 
             if [ "$DryRun" = true ]; then
