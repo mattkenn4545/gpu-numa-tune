@@ -925,6 +925,41 @@ system_manage_settings() {
         fi
     }
 
+    # Helper for managing systemd services. Does not persist state or use SystemConfig as whether the service is present is sufficient
+    manage_service() {
+        local service_name="$1"
+        local service="${service_name}.service"
+
+        if [ "$DryRun" = false ]; then
+          if ! systemctl list-unit-files "$service" >/dev/null 2>&1; then
+              return 0
+          fi
+        fi
+
+        if [ "$action" = "tune" ]; then
+            if [ "$DryRun" = false ]; then
+                if systemctl stop "$service" 2>/dev/null; then
+                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$service" "stopped" "Latency"
+                else
+                    [ "$SystemTuned" == "" ] && printf "  [FAIL] %-28s -> %-10s (%s)\n" "$service" "stop failed" "Latency"
+                fi
+            else
+                [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$service" "stop" "Latency"
+            fi
+        else
+            # action = restore
+            if [ "$DryRun" = false ]; then
+                if systemctl start "$service" 2>/dev/null; then
+                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$service" "started" "Restore"
+                else
+                    [ "$SystemTuned" == "" ] && printf "  [FAIL] %-28s -> %-10s (%s)\n" "$service" "start failed" "Restore"
+                fi
+            else
+                [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$service" "start" "Restore"
+            fi
+        fi
+    }
+
     # Helper for IRQ affinity
     manage_irq_affinity() {
         [ "$OptimizeIrqs" != true ] && return 0
@@ -977,6 +1012,8 @@ system_manage_settings() {
     manage_sysctl "net.core.busy_poll" "50" "Network Latency"
     manage_sysctl "vm.stat_interval" "10" "Jitter Reduction"
     manage_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
+    manage_service irqbalance
+    manage_service numad
     manage_irq_affinity
 
     # PCIe Max Performance
@@ -1081,10 +1118,6 @@ system_manage_settings() {
     fi
 
     if [ "$action" = "tune" ]; then
-        if pgrep -x numad >/dev/null 2>&1; then
-            [ "$SystemTuned" == "" ] && echo "  [WARNING] numad daemon is running. This may contend with manual optimization."
-            [ "$SystemTuned" == "" ] && echo "            Consider stopping it: 'sudo systemctl stop numad'"
-        fi
         [ "$SystemTuned" == "" ] && echo "--> System tuning complete."
         [ "$SystemTuned" == "" ] && echo "------------------------------------------------------------------------------------------------"
       SystemTuned=true
@@ -1340,7 +1373,7 @@ run_optimization() {
                 local m_res=$?
                 [ "$m_res" -eq 2 ] && status_msg="OPTIMIZED (MOVE FAILED)"
                 [ "$m_res" -eq 3 ] && status_msg="OPTIMIZED (NODE FULL)"
-                [ "$m_res" -eq 5 ] && status_msg="OPTIMIZED (CPU ONLY - AGED PROCESS)"
+                [ "$m_res" -eq 5 ] && status_msg="OPTIMIZED (AGED PROCESS)"
             fi
 
             if [ "$DryRun" = true ]; then

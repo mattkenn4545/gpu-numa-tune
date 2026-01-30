@@ -17,7 +17,7 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **🏎️ Max Performance Mode:** Optional high-performance mode that forces the GPU and PCIe bus to stay in their highest power states, preventing micro-stutter from power-saving transitions.
 - **🩺 PCIe Health Check:** Monitors and warns if the GPU is not running at its maximum supported PCIe generation or link width (e.g., running at x8 instead of x16).
 - **🛡️ Cross-Vendor Support:** Seamlessly works with NVIDIA, AMD, and Intel GPUs.
-- **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes. Summaries are automatically silenced after 2 hours of inactivity to keep your logs clean, and will resume once a qualifying process is detected.
+- **🔄 Smart Daemon Mode:** Silently monitors your system every 10 seconds, optimizing new games as they launch and providing status summaries every 30 minutes. Summaries are automatically silenced after 2 hours of inactivity to keep your logs clean.
 - **🔔 Smart Notifications:** Aggregates multiple process optimizations (like when a game launches with several helper processes) into a single, clean notification to avoid spam.
 - **⚖️ Priority Management:** Gives games higher CPU (`renice`) and IO (`ionice`) priority to ensure they aren't throttled by background tasks.
 - **🧬 Nearby Node Support:** If the local node is full, it intelligently expands to the next closest nodes based on hardware distance.
@@ -79,7 +79,7 @@ You can also create process-specific configuration files. The optimizer looks fo
 
 These per-process configs can override settings like `UseHt`, `IncludeNearby`, `MaxDist`, `StrictMem`, `ReniceValue`, and `IoniceValue` for that specific game without affecting global behavior.
 
-When a new process is optimized, the script automatically creates a template configuration file in your user config directory (if `AutoGenConfig=true`), populated with the current global defaults.
+When a new process is optimized, the script automatically creates a template configuration file in `~/.config/gpu-numa-tune/` (if `AutoGenConfig=true`), populated with the current global defaults.
 
 **Note:** Command-line options always take precedence over configuration file values.
 
@@ -114,7 +114,7 @@ GpuIndex=0
 | `AutoGenConfig` | Create per-command default configuration files | `true` |
 | `MaxAllTimeLogLines` | Max lines to keep in `~/.gpu_numa_optimizations` | `10000` |
 | `OptimizeIrqs` | Pin GPU interrupts to local NUMA node (`true`/`false`) | `true` |
-| `GpuIndex` | Default GPU index to target | `0` |
+| `GpuIndex` | Default GPU index to target (from `lspci`) | `0` |
 | `SummaryInterval` | Interval between periodic summary reports (seconds) | `1800` |
 | `SummarySilenceTimeout` | Stop summaries after inactivity (seconds) | `7200` |
 | `HeaderInterval` | Number of log lines before repeating table header | `20` |
@@ -217,11 +217,11 @@ When at least one process is optimized, the script periodically verifies the GPU
 
 ### 7. Smart Notification Aggregation
 To prevent notification spam during complex game launches (e.g., Wine/Proton games starting `wineserver`, `explorer.exe`, and the game itself), the script implements a buffering system:
-- **Delayed Delivery**: When a new optimization is detected, the daemon waits `SleepInterval + 5` seconds to catch any subsequent processes.
+- **Delayed Delivery**: When a new optimization is detected, the daemon waits `SleepInterval` seconds to catch any subsequent processes.
 - **Amalgamated Messaging**: All processes optimized within that window are grouped into a single notification.
 - **Primary Process Highlighting**: The process with the largest memory footprint (RSS) is automatically identified as the primary process and highlighted in the notification. This ensures the actual game is prioritized over helper processes like `wineserver`.
 - **Warning Propagation**: If any single process in a batch fails migration or encounters full nodes, the entire notification is upgraded to a warning icon.
-- **Automatic Summary & Silencing**: In daemon mode, a periodic summary of all active optimizations and total session stats is logged to the system journal every 30 minutes. This process also cleans up any tracked processes that are no longer running. To avoid cluttering logs during long periods of inactivity, these summaries are automatically silenced after 2 hours if no new processes are optimized. They resume immediately once a qualifying process is detected.
+- **Automatic Summary & Silencing**: In daemon mode, a periodic summary of all active optimizations and total session stats is logged to the system journal every 30 minutes. This process also cleans up any tracked processes that are no longer running. To avoid cluttering logs during long periods of inactivity, these summaries are automatically silenced after 2 hours if no new processes are optimized.
 
 ### 8. Persistent Tracking & Log Management
 To provide a long-term view of your system's performance tuning, the script maintains a persistent log file:
@@ -236,6 +236,9 @@ GPU NUMA Optimizer manages system-level kernel parameters dynamically to ensure 
 - **Original Value Persistence**: When the script first tunes a system setting, it reads the current kernel value and appends it to `/etc/gpu-numa-tune.conf`. This ensures that the original system state is "remembered" across reboots and service restarts.
 - **Automatic Restoration**: When the last optimized process exits, or when the `gpu-numa-optimizer` service is stopped, the script automatically reverts all modified kernel parameters to their original values stored in the configuration file.
 - **Manual Override**: If you wish to skip system-level tuning entirely, use the `--no-tune` flag or set `SkipSystemTune=true` in your configuration.
+
+### 10. Manual Priority Control
+If you wish to manually set or change the priority of a running process, you can do so by creating or updating its per-process configuration file. The script will pick up the new `ReniceValue` or `IoniceValue` and apply it to the running process during the next optimization sweep.
 
 ---
 

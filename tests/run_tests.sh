@@ -302,9 +302,39 @@ sysctl() { return 0; }
 MOCK_EUID=0
 SkipSystemTune=false
 SystemTuned="" # Reset SystemTuned to allow printing/tuning
+
+# Mock systemctl
+SYSTEMCTL_STOP_CALLED_COUNT=0
+SYSTEMCTL_START_CALLED_COUNT=0
+systemctl() {
+    case "$1" in
+        list-unit-files) return 0 ;; # Pretend all services exist
+        is-active) return 0 ;; # Pretend it's active
+        stop) SYSTEMCTL_STOP_CALLED_COUNT=$((SYSTEMCTL_STOP_CALLED_COUNT + 1)); return 0 ;;
+        start) SYSTEMCTL_START_CALLED_COUNT=$((SYSTEMCTL_START_CALLED_COUNT + 1)); return 0 ;;
+    esac
+}
+
 system_manage_settings "tune"
 
 assert_eq "false" "$SYSCTL_CALLED" "Dry-run: sysctl not called"
+assert_eq "0" "$SYSTEMCTL_STOP_CALLED_COUNT" "Dry-run: systemctl stop not called"
+
+# Test 9.1: system_manage_settings "tune" (NOT DryRun)
+echo "Test 9.1: system_manage_settings 'tune' (NOT DryRun)"
+DryRun=false
+SystemTuned=""
+SYSTEMCTL_STOP_CALLED_COUNT=0
+system_manage_settings "tune" > /dev/null
+assert_eq "2" "$SYSTEMCTL_STOP_CALLED_COUNT" "system_manage_settings 'tune' stops irqbalance and numad"
+
+# Test 9.2: system_manage_settings "restore"
+echo "Test 9.2: system_manage_settings 'restore'"
+SystemTuned=true
+SYSTEMCTL_START_CALLED_COUNT=0
+system_manage_settings "restore" > /dev/null
+assert_eq "2" "$SYSTEMCTL_START_CALLED_COUNT" "system_manage_settings 'restore' starts irqbalance and numad"
+DryRun=true # Reset for next tests
 
 # Mocking for run_optimization
 PROC_PREFIX="$(pwd)/tests/mock_proc"
