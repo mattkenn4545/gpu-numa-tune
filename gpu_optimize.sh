@@ -1298,7 +1298,9 @@ run_optimization() {
         [ -z "$raw_current_affinity" ] && continue
         local current_normalized_mask=$(normalize_affinity "$raw_current_affinity")
 
-        if [ "$current_normalized_mask" != "$l_TargetNormalizedMask" ]; then
+        # We optimize if the mask doesn't match OR if we haven't tracked this PID as optimized yet
+        # (to ensure memory policies and priorities are applied at least once)
+        if [ "$current_normalized_mask" != "$l_TargetNormalizedMask" ] || [ -z "${OptimizedPidsMap[$pid]}" ]; then
             # Optimization required
             apply_process_policies "$pid" "$l_TargetNormalizedMask" "$l_NearbyNodeIds" "$l_NumaNodeId" "$l_StrictMem" "$l_ReniceValue" "$l_IoniceValue"
 
@@ -1316,15 +1318,6 @@ run_optimization() {
 
             if [ "$DryRun" = true ]; then
                 [[ "$status_msg" == *"MOVED"* ]] && status_msg="WOULD MOVE" || status_msg="DRY RUN ($status_msg)"
-            fi
-
-            # Check if affinity already matches
-            if [ "$current_normalized_mask" = "$l_TargetNormalizedMask" ]; then
-                # Even if affinity matches, we might want to ensure priority/ionice are set
-                # But to avoid overhead in the daemon loop, we only do this once
-                if [ -z "${OptimizedPidsMap[$pid]}" ]; then
-                     apply_process_policies "$pid" "$l_TargetNormalizedMask" "$l_NearbyNodeIds" "$l_NumaNodeId" "$l_StrictMem" "$l_ReniceValue" "$l_IoniceValue"
-                fi
             fi
 
             # Queue for notification
@@ -1349,16 +1342,6 @@ run_optimization() {
                 fi
             fi
             OptimizedPidsMap[$pid]=$(date +%s)
-        else
-            if [ -z "${OptimizedPidsMap[$pid]}" ]; then
-                # Already optimized but not yet tracked in this session
-                local status_msg="OPTIMIZED"
-                [ "$DryRun" = true ] && status_msg="DRY RUN ($status_msg)"
-                status_log "$pid" "$proc_comm" "$simplified_cmd" "$(format_range "$l_TargetNormalizedMask")" "$status_msg" "$overrides"
-                OptimizedPidsMap[$pid]=$(date +%s)
-                LastOptimizationTime=$(date +%s)
-                SummarySilenced=false
-            fi
         fi
 
         # Restore globals for next process in the loop
