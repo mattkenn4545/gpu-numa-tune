@@ -692,6 +692,106 @@ PcieWarningLogged=false
 check_pcie_speed
 assert_eq "" "$LOG_OUTPUT" "check_pcie_speed no warning when matching"
 
+# Test 15b: check_pcie_speed with Resizable BAR (NVIDIA)
+echo "Test 15b: check_pcie_speed with Resizable BAR (NVIDIA)"
+
+# Mock lspci and nvidia-smi
+lspci() {
+    if [[ "$*" == *"-s 0000:01:00.0"* ]]; then
+        if [[ "$*" == *"-vv"* ]]; then
+            echo "Capabilities: [150 v1] Resizable BAR <?>BAR 0: current: 256MB, supported: 256MB 512MB 1GB 2GB 4GB 8GB 16GB"
+        elif [[ "$*" == *"-v"* ]]; then
+            echo "Memory at ... [size=256M]"
+        else
+            echo "01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+        fi
+    fi
+}
+export -f lspci
+
+nvidia-smi() {
+    echo "Resizable BAR : Disabled"
+}
+export -f nvidia-smi
+
+LOG_OUTPUT=""
+PcieWarningLogged=false
+check_pcie_speed
+
+echo "$LOG_OUTPUT" | grep -q "WARNING: Resizable BAR is disabled in NVIDIA settings/BIOS!"
+assert_eq "0" "$?" "check_pcie_speed detects disabled ReBAR on NVIDIA"
+
+# Test 15c: check_pcie_speed with Resizable BAR (AMD)
+echo "Test 15c: check_pcie_speed with Resizable BAR (AMD)"
+
+lspci() {
+    if [[ "$*" == *"-s 0000:01:00.0"* ]]; then
+        if [[ "$*" == *"-vv"* ]]; then
+            echo "Capabilities: [150 v1] Resizable BAR <?>BAR 0: current: 256MB, supported: 256MB 512MB 1GB 2GB 4GB 8GB 16GB"
+        else
+            echo "01:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800/6800 XT / 6900 XT] (rev c1)"
+        fi
+    fi
+}
+# We need to redefine lspci for the test
+LOG_OUTPUT=""
+PcieWarningLogged=false
+check_pcie_speed
+
+echo "$LOG_OUTPUT" | grep -q "WARNING: Resizable BAR is only 256MB! (Likely disabled in BIOS)"
+assert_eq "0" "$?" "check_pcie_speed detects small ReBAR on AMD"
+
+# Cleanup mocks
+unset -f lspci
+unset -f nvidia-smi
+
+# Test 15d: check_pcie_speed with suboptimal MPS
+echo "Test 15d: check_pcie_speed with suboptimal MPS"
+
+lspci() {
+    if [[ "$*" == *"-s 0000:01:00.0"* ]]; then
+        if [[ "$*" == *"-vv"* ]]; then
+            echo "                DevCap: MaxPayload 256 bytes, PhantFunc 0, Latency L0s <64ns, L1 unlimited"
+            echo "                DevCtl: CorrErr+ NonFatalErr+ FatalErr+ UnsupReq-"
+            echo "                        MaxPayload 128 bytes, MaxReadReq 512 bytes"
+        else
+            echo "01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+        fi
+    fi
+}
+
+LOG_OUTPUT=""
+PcieWarningLogged=false
+check_pcie_speed
+
+echo "$LOG_OUTPUT" | grep -q "WARNING: PCIe Max Payload Size (MPS) is suboptimal! Current: 128B, Capable: 256B"
+assert_eq "0" "$?" "check_pcie_speed detects suboptimal MPS"
+
+# Test 15e: check_pcie_speed with low MRRS
+echo "Test 15e: check_pcie_speed with low MRRS"
+
+lspci() {
+    if [[ "$*" == *"-s 0000:01:00.0"* ]]; then
+        if [[ "$*" == *"-vv"* ]]; then
+            echo "                DevCap: MaxPayload 256 bytes, PhantFunc 0, Latency L0s <64ns, L1 unlimited"
+            echo "                DevCtl: CorrErr+ NonFatalErr+ FatalErr+ UnsupReq-"
+            echo "                        MaxPayload 256 bytes, MaxReadReq 128 bytes"
+        else
+            echo "01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
+        fi
+    fi
+}
+
+LOG_OUTPUT=""
+PcieWarningLogged=false
+check_pcie_speed
+
+echo "$LOG_OUTPUT" | grep -q "WARNING: PCIe Max Read Request Size (MRRS) is low (128B)! This may limit performance."
+assert_eq "0" "$?" "check_pcie_speed detects low MRRS"
+
+# Cleanup mocks
+unset -f lspci
+
 # Test 16: system_tune with MaxPerf
 echo "Test 16: system_tune with MaxPerf"
 MOCK_EUID=0

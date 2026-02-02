@@ -231,13 +231,8 @@ status_log() {
     ((LogLineCount++))
 }
 
-# Logs messages to syslog in daemon mode, or stdout otherwise
 log() {
-    if [ "$DaemonMode" = true ]; then
-        logger -t gpu-numa-tune "$1"
-    else
-        echo "$1"
-    fi
+    echo "$1"
 }
 
 usage() {
@@ -336,6 +331,8 @@ flush_notifications() {
 # --- System Discovery & Hardware Info ---
 
 # Checks if the GPU is running at its maximum PCIe link speed and width.
+# Also checks if Resizable BAR is enabled and
+#   PCIe Max Payload Size (MPS) and Max Read Request Size (MRRS) is appropriate
 # Logs a warning if it's not.
 check_pcie_speed() {
     [ "$PcieWarningLogged" = true ] && return
@@ -356,6 +353,53 @@ check_pcie_speed() {
     if [ -n "$cur_width" ] && [ -n "$max_width" ] && [ "$cur_width" != "$max_width" ]; then
         log "WARNING: GPU is not running at max PCIe width! Current: x$cur_width, Max: x$max_width"
         warned=true
+    fi
+
+    # Check Resizable BAR
+    if command -v lspci >/dev/null 2>&1; then
+        local lspci_vv=$(lspci -vv -s "$PciAddr" 2>/dev/null)
+        if echo "$lspci_vv" | grep -q "Capabilities: .* Resizable BAR"; then
+            # Capability found, check if it is enabled (has a BAR that is resized)
+            local lspci_s=$(lspci -s "$PciAddr" 2>/dev/null)
+            # Better check: nvidia-smi if it's NVIDIA
+            if [[ "$lspci_s" == *"NVIDIA"* ]] && command -v nvidia-smi >/dev/null 2>&1; then
+                if nvidia-smi -q -i "$PciAddr" 2>/dev/null | grep -q "Resizable BAR.*Disabled"; then
+                    log "WARNING: Resizable BAR is disabled in NVIDIA settings/BIOS!"
+                    warned=true
+                fi
+            elif [[ "$lspci_s" == *"Advanced Micro Devices"* ]]; then
+                 # For AMD, check if BAR size is 256MB while larger sizes are supported
+                 if echo "$lspci_vv" | grep -A 10 "Resizable BAR" | grep -q "current: 256MB" && \
+                    echo "$lspci_vv" | grep -A 10 "Resizable BAR" | grep -qE "1GB|2GB|4GB|8GB|16GB"; then
+                     log "WARNING: Resizable BAR is only 256MB! (Likely disabled in BIOS)"
+                     warned=true
+                 fi
+            fi
+        fi
+
+        # Check PCIe Max Payload Size (MPS) and Max Read Request Size (MRRS)
+        # DevCap: MaxPayload 256 bytes, ...
+        # DevCtl: ... MaxPayload 128 bytes, MaxReadReq 512 bytes
+        local dev_cap=$(echo "$lspci_vv" | grep -A 2 "DevCap:" | grep "MaxPayload" | head -n 1)
+        local dev_ctl=$(echo "$lspci_vv" | grep -A 2 "DevCtl:" | grep "MaxPayload" | head -n 1)
+
+        if [ -n "$dev_cap" ] && [ -n "$dev_ctl" ]; then
+            local max_payload_cap=$(echo "$dev_cap" | sed -n 's/.*MaxPayload \([0-9]*\) bytes.*/\1/p')
+            local max_payload_cur=$(echo "$dev_ctl" | sed -n 's/.*MaxPayload \([0-9]*\) bytes.*/\1/p')
+            local max_read_req=$(echo "$dev_ctl" | sed -n 's/.*MaxReadReq \([0-9]*\) bytes.*/\1/p')
+
+            if [ -n "$max_payload_cap" ] && [ -n "$max_payload_cur" ] && [ "$max_payload_cur" -lt "$max_payload_cap" ]; then
+                log "WARNING: PCIe Max Payload Size (MPS) is suboptimal! Current: ${max_payload_cur}B, Capable: ${max_payload_cap}B"
+                warned=true
+            fi
+
+            # Typically MaxReadReq should be at least as large as MaxPayload, and often larger (e.g. 512B or 4096B)
+            # 128B is usually too low for high performance GPUs
+            if [ -n "$max_read_req" ] && [ "$max_read_req" -le 128 ]; then
+                 log "WARNING: PCIe Max Read Request Size (MRRS) is low (${max_read_req}B)! This may limit performance."
+                 warned=true
+            fi
+        fi
     fi
 
     [ "$warned" = true ] && PcieWarningLogged=true
@@ -432,7 +476,7 @@ discover_resources() {
     fi
 
     if [ -z "$RawCpuList" ] || [ "$RawCpuList" == " " ]; then
-        echo "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
+        log "Warning: Could not determine local CPU list for GPU. Falling back to all CPUs."
         RawCpuList=$(cat "$SYSFS_PREFIX/sys/devices/system/cpu/online" 2>/dev/null)
     fi
 }
@@ -709,7 +753,7 @@ batch_load_proc_info() {
     while read -r l_pid l_ppid l_comm l_args; do
         [[ "$l_pid" =~ ^[0-9]+$ ]] || continue
         BatchedProcInfoMap["$l_pid"]="$l_ppid|$l_comm|$l_args"
-    done < <(ps -eo pid,ppid,comm,args --no-headers 2>/dev/null)
+    done < <(ps -eo pid,ppid,comm,args --no-headers 2>/dev/null | sed 's/^[[:space:]]*//')
 }
 
 # Determines if a PID should be optimized based on its environment and command line.
@@ -925,6 +969,33 @@ system_manage_settings() {
         fi
     }
 
+    # Helper for generic sysfs/file settings
+    manage_setting() {
+        local key="$1"
+        local file_path="$2"
+        local tune_val="$3"
+        local label="$4"
+
+        [ ! -f "$file_path" ] && return 0
+        local target_val=$(get_target_val "$key" "$tune_val")
+        [ -z "$target_val" ] && return 0
+
+        if [ "$action" = "tune" ]; then
+            local current_val=$(cat "$file_path" 2>/dev/null)
+            persist_original_value "$key" "$current_val"
+        fi
+
+        if [ "$DryRun" = false ]; then
+            if echo "$target_val" > "$file_path" 2>/dev/null; then
+                [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+            else
+                [ "$SystemTuned" == "" ] && printf "  [FAIL] %-28s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+            fi
+        else
+            [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+        fi
+    }
+
     # Helper for managing systemd services. Does not persist state or use SystemConfig as whether the service is present is sufficient
     manage_service() {
         local service_name="$1"
@@ -1018,78 +1089,15 @@ system_manage_settings() {
 
     # PCIe Max Performance
     if [ "$MaxPerf" = true ] || [ "$action" = "restore" ]; then
-        # 1. Global ASPM policy
-        local policy_file="$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy"
-        if [ -f "$policy_file" ]; then
-            local target_aspm=$(get_target_val "pcie_aspm_policy" "performance")
-            if [ -n "$target_aspm" ]; then
-                [ "$action" = "tune" ] && persist_original_value "pcie_aspm_policy" "$(cat "$policy_file" 2>/dev/null)"
-                if [ "$DryRun" = false ]; then
-                    echo "$target_aspm" > "$policy_file" 2>/dev/null
-                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "pcie_aspm_policy" "$target_aspm" "PCIe Perf"
-                else
-                    [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "pcie_aspm_policy" "$target_aspm" "PCIe Perf"
-                fi
-            fi
-        fi
-
-        # 2. GPU Runtime PM
-        local rpm_file="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control"
-        if [ -f "$rpm_file" ]; then
-            local target_rpm=$(get_target_val "gpu_runtime_pm_control" "on")
-            if [ -n "$target_rpm" ]; then
-                [ "$action" = "tune" ] && persist_original_value "gpu_runtime_pm_control" "$(cat "$rpm_file" 2>/dev/null)"
-                if [ "$DryRun" = false ]; then
-                    echo "$target_rpm" > "$rpm_file" 2>/dev/null
-                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "gpu_runtime_pm" "$target_rpm" "PCIe Perf"
-                else
-                    [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "gpu_runtime_pm" "$target_rpm" "PCIe Perf"
-                fi
-            fi
-        fi
-
-        # 3. GPU ASPM/Clock PM
-        for link_name in "l1_aspm" "clkpm"; do
-            local link_file="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/$link_name"
-            if [ -f "$link_file" ]; then
-                local target_val=$(get_target_val "gpu_$link_name" "0")
-                if [ -n "$target_val" ]; then
-                    [ "$action" = "tune" ] && persist_original_value "gpu_$link_name" "$(cat "$link_file" 2>/dev/null)"
-                    local display_val="$target_val"
-                    [ "$target_val" = "0" ] && [ "$action" = "tune" ] && display_val="disabled"
-                    if [ "$DryRun" = false ]; then
-                        echo "$target_val" > "$link_file" 2>/dev/null
-                        [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "gpu_$link_name" "$display_val" "PCIe Perf"
-                    else
-                        [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "gpu_$link_name" "$display_val" "PCIe Perf"
-                    fi
-                fi
-            fi
-        done
+        manage_setting "pcie_aspm_policy" "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy" "performance" "PCIe Perf"
+        manage_setting "gpu_runtime_pm_control" "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power/control" "on" "PCIe Perf"
+        manage_setting "gpu_l1_aspm" "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/l1_aspm" "0" "PCIe Perf"
+        manage_setting "gpu_clkpm" "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/clkpm" "0" "PCIe Perf"
     fi
 
     # Transparent Hugepages (THP)
-    manage_thp() {
-        local key="$1"
-        local path="$2"
-        local tune_val="$3"
-        local label="$4"
-
-        if [ -f "$path" ]; then
-            local target_val=$(get_target_val "$key" "$tune_val")
-            if [ -n "$target_val" ]; then
-                [ "$action" = "tune" ] && persist_original_value "$key" "$(cat "$path" 2>/dev/null)"
-                if [ "$DryRun" = false ]; then
-                    echo "$target_val" > "$path" 2>/dev/null
-                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$target_val" "$label"
-                else
-                    [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$target_val" "$label"
-                fi
-            fi
-        fi
-    }
-    manage_thp "transparent_hugepage" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" "never" "Latency"
-    manage_thp "thp_defrag" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" "never" "Latency"
+    manage_setting "transparent_hugepage" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" "never" "Latency"
+    manage_setting "thp_defrag" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" "never" "Latency"
 
     # CPU Scaling Governor
     if [ -d "$SYSFS_PREFIX/sys/devices/system/cpu/cpufreq" ]; then
@@ -1367,13 +1375,14 @@ run_optimization() {
             local target_nodes="${l_NearbyNodeIds:-$l_NumaNodeId}"
 
             local status_msg="OPTIMIZED"
+            local skip_lifetime_optimized_count=false
             if migrate_process_memory "$pid" "$target_nodes" "$process_rss_kb"; then
                 [ "$target_nodes" != "-1" ] && status_msg="OPTIMIZED & MOVED"
             else
                 local m_res=$?
                 [ "$m_res" -eq 2 ] && status_msg="OPTIMIZED (MOVE FAILED)"
                 [ "$m_res" -eq 3 ] && status_msg="OPTIMIZED (NODE FULL)"
-                [ "$m_res" -eq 5 ] && status_msg="OPTIMIZED (AGED PROCESS)"
+                [ "$m_res" -eq 5 ] && status_msg="OPTIMIZED (AGED PROCESS)" && skip_lifetime_optimized_count=true
             fi
 
             if [ "$DryRun" = true ]; then
@@ -1384,7 +1393,7 @@ run_optimization() {
             PendingOptimizations+=("$pid|$proc_comm|$simplified_cmd|$status_msg|$target_nodes|$process_rss_kb")
             status_log "$pid" "$proc_comm" "$simplified_cmd" "$(format_range "$l_TargetNormalizedMask")" "$status_msg" "$overrides"
 
-            if [ -z "${OptimizedPidsMap[$pid]}" ]; then
+            if [ -z "${OptimizedPidsMap[$pid]}" ] && [ "$skip_lifetime_optimized_count" = false ]; then
                 ((TotalOptimizedCount++))
                 ((LifetimeOptimizedCount++))
                 LastOptimizationTime=$(date +%s)
@@ -1454,7 +1463,7 @@ summarize_optimizations() {
         status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "OPTIMIZING" "$summary_msg"
 
         if [ "$PerformanceWarningsCount" -gt 0 ]; then
-            log "Notice: $PerformanceWarningsCount performance warnings (20s+ loop) recorded since startup."
+            echo "Notice: $PerformanceWarningsCount performance warnings (20s+ loop) recorded since startup."
         fi
 
         PcieWarningLogged=false
@@ -1692,6 +1701,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     # Everything below runs either as root (if DropPrivs=false)
     # or as the target user (if DropPrivs=true, in the child process).
 
+    # Initialize maps
+    declare -A BatchedProcInfoMap
+    declare -A OptimizedPidsMap
+    declare -A NonGamingPidsMap
+
     load_all_time_stats
 
     # Capture global configuration baseline for override detection
@@ -1721,7 +1735,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             # If optimizations were performed, wait a short while for related processes
             # (e.g., a game launcher starting the game engine) to appear.
             if [ ${#PendingOptimizations[@]} -gt 0 ]; then
-                log "Optimized ${#PendingOptimizations[@]} process(es). Waiting ${SleepInterval}s to aggregate more..."
                 # Sleep to give launchers etc... time to get all processes started
                 sleep "$SleepInterval" &
                 wait $!
