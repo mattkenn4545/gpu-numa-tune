@@ -231,8 +231,14 @@ status_log() {
     ((LogLineCount++))
 }
 
+# Standard log function for informational exceptions to normal operation.
 log() {
-    echo "$1"
+    echo "[LOG] $(date "+%H:%M:%S") - $1"
+}
+
+# Standard error function for critical failures.
+error() {
+    echo "[ERROR] $(date "+%H:%M:%S") - $1" >&2
 }
 
 usage() {
@@ -434,19 +440,19 @@ detect_gpu() {
     fi
 
     if [ "${#all_gpu_pci[@]}" -eq 0 ]; then
-        echo "Error: No GPU (VGA/3D) devices detected."
+        error "No GPU (VGA/3D) devices detected."
         exit 1
     fi
 
     if [ "$GpuIndexArg" -ge "${#all_gpu_pci[@]}" ]; then
-        echo "Error: GPU index $GpuIndexArg not found (Found ${#all_gpu_pci[@]} GPUs)."
+        error "GPU index $GpuIndexArg not found (Found ${#all_gpu_pci[@]} GPUs)."
         exit 1
     fi
 
     PciAddr="${all_gpu_pci[$GpuIndexArg]}"
 
     if [ -z "$PciAddr" ]; then
-        echo "Error: Could not determine PCI address for GPU index $GpuIndexArg."
+        error "Could not determine PCI address for GPU index $GpuIndexArg."
         exit 1
     fi
 }
@@ -459,7 +465,7 @@ discover_resources() {
 
     local device_sys_dir="$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr"
     if [ ! -d "$device_sys_dir" ]; then
-        echo "Error: PCI device directory $device_sys_dir not found."
+        error "PCI device directory $device_sys_dir not found."
         exit 1
     fi
 
@@ -902,7 +908,7 @@ system_manage_settings() {
     if [ "$eff_euid" -ne 0 ]; then
         if [ "$SystemTuned" == "" ]; then
             echo "------------------------------------------------------------------------------------------------"
-            echo "WARNING: Not running as root. Latency tuning skipped."
+            log "Notice: Not running as root. Latency tuning skipped."
             echo "------------------------------------------------------------------------------------------------"
         fi
         return 1
@@ -912,7 +918,7 @@ system_manage_settings() {
         # Reload config to ensure we have the latest original values for restoration
         [ -f "$SystemConfig" ] && parse_config_file "$SystemConfig"
         [ ! -f "$SystemConfig" ] && {
-            [ "$SystemTuned" = true ] && echo "Warning: Restoration config $SystemConfig missing."
+            [ "$SystemTuned" = true ] && log "Warning: Restoration config $SystemConfig missing."
             return 1
         }
     else
@@ -1463,7 +1469,7 @@ summarize_optimizations() {
         status_log "$TotalOptimizedCount procs" "since startup" "" "$LifetimeOptimizedCount all time" "OPTIMIZING" "$summary_msg"
 
         if [ "$PerformanceWarningsCount" -gt 0 ]; then
-            echo "Notice: $PerformanceWarningsCount performance warnings (20s+ loop) recorded since startup."
+            log "Notice: $PerformanceWarningsCount performance warnings (20s+ loop) recorded since startup."
         fi
 
         PcieWarningLogged=false
@@ -1553,17 +1559,17 @@ parse_args() {
                 if [[ "$2" =~ ^[0-9]+$ ]]; then
                     MaxAllTimeLogLines=$2; shift 2
                 else
-                    echo "Error: --max-log-lines requires a numeric argument." >&2
+                    error "--max-log-lines requires a numeric argument."
                     exit 1
                 fi
                 ;;
             -h|--help) usage ;;
-            -*) echo "Unknown option: $1" ; usage ;;
+            -*) error "Unknown option: $1" ; usage ;;
             *)
                 if [[ "$1" =~ ^[0-9]+$ ]]; then
                     GpuIndexArg=$1; shift
                 else
-                    echo "Error: GPU index must be a numeric value: $1" >&2
+                    error "GPU index must be a numeric value: $1"
                     exit 1
                 fi
                 ;;
@@ -1578,9 +1584,9 @@ check_dependencies() {
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             if [ "$cmd" = "notify-send" ] || [ "$cmd" = "setpriv" ]; then
-                echo "Warning: '$cmd' not found. Desktop notifications or privilege dropping may be limited."
+                log "Warning: '$cmd' not found. Desktop notifications or privilege dropping may be limited."
             else
-                echo "Error: Required command '$cmd' not found."
+                error "Required command '$cmd' not found."
                 exit 1
             fi
         fi
@@ -1751,8 +1757,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             duration_ms=$((duration_ns / 1000000))
 
             if [ "$duration_ms" -gt 20000 ]; then
-                warning_msg="Daemon loop took ${duration_ms}ms (exceeding 20s warning threshold)"
-                echo "WARNING: $warning_msg"
+                log "Warning: Daemon loop took ${duration_ms}ms (exceeding 20s warning threshold)"
                 # Record that a performance warning occurred for the summary
                 ((PerformanceWarningsCount++))
             fi
