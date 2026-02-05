@@ -1443,10 +1443,9 @@ summarize_optimizations() {
 
     LastOptimizedCount=$current_optimized_count
 
-    local summary_msg=""
+    local summary_msg="${current_optimized_count} processes currently optimized"
     if [ "$current_optimized_count" -eq 0 ]; then
         trigger_system_management "restore"
-        summary_msg="No processes currently optimized"
     fi
 
     if [ "$should_summarize" = true ]; then
