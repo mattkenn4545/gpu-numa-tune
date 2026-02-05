@@ -10,7 +10,7 @@
 # Mechanism:
 #   1. Detects the NUMA node closest to a specified GPU (default: index 0).
 #   2. Optionally identifies "nearby" NUMA nodes based on hardware distance.
-#   3. Tunes system parameters (sysctl, THP, CPU governors) for low latency.
+#   3. Tunes system parameters (sysctl, CPU governors) for low latency.
 #   4. Monitors for processes using the GPU (render nodes/NVIDIA devices).
 #   5. Applies CPU affinity (pinning) and memory policies (membind/preferred)
 #      to ensure the process runs on the optimal CPU cores and memory nodes.
@@ -881,7 +881,7 @@ persist_original_value() {
     fi
     [ ! -w "$config_dir" ] && return
 
-    # Extract the active value enclosed in brackets if present (e.g., for THP)
+    # Extract the active value enclosed in brackets if present
     if [[ "$value" =~ \[([^\]]+)\] ]]; then
         value="${BASH_REMATCH[1]}"
     fi
@@ -1100,10 +1100,6 @@ system_manage_settings() {
         manage_setting "gpu_l1_aspm" "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/l1_aspm" "0" "PCIe Perf"
         manage_setting "gpu_clkpm" "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link/clkpm" "0" "PCIe Perf"
     fi
-
-    # Transparent Hugepages (THP)
-    manage_setting "transparent_hugepage" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" "never" "Latency"
-    manage_setting "thp_defrag" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" "never" "Latency"
 
     # CPU Scaling Governor
     if [ -d "$SYSFS_PREFIX/sys/devices/system/cpu/cpufreq" ]; then
