@@ -574,32 +574,43 @@ get_node_used_mb() {
 }
 
 detect_target_user() {
-    # Try to find the user running the graphical session
+    # Try to find a logged-in user that isn't root
     local detected_user=""
-    local user_list=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | sort -u)
 
-    for u in $user_list; do
-        local sids=$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$u" '$3==u {print $1}')
-        for sid in $sids; do
-            local type=$(loginctl show-session "$sid" -p Type --value 2>/dev/null)
-            local state=$(loginctl show-session "$sid" -p State --value 2>/dev/null)
-            if [[ "$type" =~ ^(x11|wayland)$ ]] && [ "$state" = "active" ]; then
-                detected_user="$u"
-                break 2
-            fi
-        done
+    while [ -z "$detected_user" ]; do
+        # Use loginctl list-users to find non-root users
+        # Format: UID USER LINGERING STATE
+        local user_list=$(loginctl list-users --no-legend 2>/dev/null | awk '$2 != "root" {print $2}')
+
+        # Select the first non-root user found
+        detected_user=$(echo "$user_list" | head -n 1)
+
+        # Fallbacks if no user found via loginctl
+        if [ -z "$detected_user" ]; then
+            detected_user=$(who | awk '($2 ~ /:[0-9]/) {print $1; exit}')
+            [ -z "$detected_user" ] && detected_user="$SUDO_USER"
+            [ -z "$detected_user" ] && [ "$EUID" -ne 0 ] && detected_user="$USER"
+            [ "$detected_user" = "root" ] && detected_user=""
+        fi
+
+        if [ -n "$detected_user" ]; then
+            TargetUser="$detected_user"
+            TargetUid=$(id -u "$TargetUser")
+            TargetGid=$(id -g "$TargetUser")
+            return 0
+        fi
+
+        # If we are in daemon mode and haven't found a user yet, wait and try again.
+        # This is important when starting at boot before any user has logged in.
+        if [ "$DaemonMode" = true ]; then
+            log "Waiting for a login session..."
+            sleep 10
+            detected_user="" # Reset for next loop
+        else
+            # Not in daemon mode, don't wait.
+            return 1
+        fi
     done
-
-    # Fallbacks
-    [ -z "$detected_user" ] && detected_user=$(who | awk '($2 ~ /:[0-9]/) {print $1; exit}')
-    [ -z "$detected_user" ] && detected_user="$SUDO_USER"
-    [ -z "$detected_user" ] && [ "$EUID" -ne 0 ] && detected_user="$USER"
-
-    if [ -n "$detected_user" ] && [ "$detected_user" != "root" ]; then
-        TargetUser="$detected_user"
-        TargetUid=$(id -u "$TargetUser")
-        TargetGid=$(id -g "$TargetUser")
-    fi
 }
 
 # --- CPU & Affinity Management ---
