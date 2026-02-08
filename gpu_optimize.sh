@@ -584,7 +584,7 @@ detect_target_user() {
     while [ -z "$detected_user" ]; do
         # Use loginctl list-users to find non-root users
         # Format: UID USER LINGERING STATE
-        local user_list=$(loginctl list-users --no-legend 2>/dev/null | awk '$2 != "root" {print $2}')
+        local user_list=$(loginctl list-users --no-legend 2>/dev/null | awk '$2 != "root" && $4 == "active" {print $2}')
 
         # Select the first non-root user found
         detected_user=$(echo "$user_list" | head -n 1)
@@ -930,7 +930,7 @@ system_manage_settings() {
     if [ "$eff_euid" -ne 0 ]; then
         if [ "$SystemTuned" == "" ]; then
             echo "------------------------------------------------------------------------------------------------"
-            log "Notice: Not running as root. Latency tuning skipped."
+            log "Notice: Not running as root..System-wide tuning skipped."
             echo "------------------------------------------------------------------------------------------------"
         fi
         return 1
@@ -943,8 +943,9 @@ system_manage_settings() {
             [ "$SystemTuned" = true ] && log "Warning: Restoration config $SystemConfig missing."
             return 1
         }
+        echo "Restoring system to original state..."
     else
-        [ "$SystemTuned" == "" ] && echo "--> Root detected. Applying system-wide optimizations..."
+        echo "Applying system-wide optimizations..."
     fi
 
     # Helper to get the target value for a setting

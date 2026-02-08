@@ -107,19 +107,22 @@ GpuIndex=0
 | `MaxDist` | Max distance from `numactl -H` for "nearby" nodes | `11` |
 | `OnlyGaming` | Only optimize games and high-perf apps | `true` |
 | `MaxPerf` | Force max PCIe performance (disable ASPM/Runtime PM) | `true` |
+| `OptimizeIrqs` | Pin GPU IRQs to the local NUMA node | `true` |
 | `TunePipeWire` | Also optimize PipeWire-related processes | `true` |
 | `ReniceValue` | Nice value for optimized processes (-20 to 19, "" to skip) | `-10` |
 | `IoniceValue` | Ionice class/value (e.g., "best-effort:0", "" to skip) | `best-effort:0` |
 | `SkipSystemTune` | Skip modifying `sysctl` or CPU governors | `false` |
-| `DryRun` | Log intended changes without applying them | `false` |
-| `DropPrivs` | Drop root privileges after system tuning | `true` |
-| `AutoGenConfig` | Create per-command default configuration files | `true` |
-| `MaxAllTimeLogLines` | Max lines to keep in `~/.gpu_numa_optimizations` | `10000` |
-| `OptimizeIrqs` | Pin GPU interrupts to local NUMA node (`true`/`false`) | `true` |
-| `GpuIndex` | Default GPU index to target (from `lspci`) | `0` |
+| `DryRun` | Log intended changes but do not apply them | `false` |
+| `DropPrivs` | Drop from root to the logged-in user after tuning | `true` |
+| `MaxAllTimeLogLines` | Max lines to keep in the all-time optimization log | `10000` |
+| `GpuIndex` | Default GPU index to optimize | `0` |
 | `SummaryInterval` | Interval between periodic summary reports (seconds) | `1800` |
-| `SummarySilenceTimeout` | Stop summaries after inactivity (seconds) | `7200` |
-| `HeaderInterval` | Number of log lines before repeating table header | `20` |
+| `SummarySilenceTimeout` | Stop summary messages after inactivity (seconds) | `7200` |
+| `HeaderInterval` | Number of log lines before repeating the table header | `20` |
+| `AutoGenConfig` | Create per-command default configuration files | `true` |
+| | | |
+| **CLI ONLY:** | | |
+| `--comm-pipe` | Path to a named pipe for external process tracking | `""` |
 
 ### 4. Command-Line Usage
 
@@ -228,7 +231,7 @@ To prevent notification spam during complex game launches (e.g., Wine/Proton gam
 
 ### 8. Persistent Tracking & Log Management
 To provide a long-term view of your system's performance tuning, the script maintains a persistent log file:
-- **`~/.gpu_numa_optimizations`**: A human-readable log file stored in the home directory of the user running the session. Each line records a unique optimization event with a timestamp, PID, process name, status, and target nodes.
+- **`~/.config/gpu-numa-tune/optimizations.log`**: A human-readable log file stored in the configuration directory. Each line records a unique optimization event with a timestamp, PID, process name, status, and target nodes.
 - **Atomic Log Trimming**: To prevent the log from growing indefinitely, it is automatically trimmed when it exceeds the configured limit (default: 10,000 lines). The script uses a 50-line buffer and atomic file operations to ensure log integrity while minimizing disk I/O.
 - **Global Stats**: The periodic status summary includes an "all-time" counter derived from this log, giving you a quick glance at how many processes have been optimized across all sessions.
 

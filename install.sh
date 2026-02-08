@@ -107,6 +107,15 @@ if [ ! -f "$INSTALL_CONFIG_PATH" ]; then
 # Also optimize PipeWire-related processes (true/false)
 #TunePipeWire=true
 
+# GPU Index to target (from lspci)
+#GpuIndex=0
+
+# Nice value for optimized processes (-20 to 19, "" to skip)
+#ReniceValue=-10
+
+# Ionice class/value (e.g., "best-effort:0", "" to skip)
+#IoniceValue=best-effort:0
+
 # SystemTune Original values
 EOF
 else
