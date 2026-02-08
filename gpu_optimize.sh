@@ -38,6 +38,7 @@ MaxPerf=true                 # If true, force PCIe device and ASPM to maximum pe
 DryRun=false                 # If true, log intended changes but do not apply them
 DropPrivs=true               # If true, drop from root to the logged-in user after system tuning
 AutoGenConfig=true           # If true, create per-command default configuration files
+TunePipeWire=true            # If true, also optimize PipeWire-related processes
 ReniceValue="-10"            # Nice value for optimized processes (-20 to 19, "" to skip)
 IoniceValue="best-effort:0"  # Ionice class/value (e.g., "best-effort:0", "" to skip)
 MaxAllTimeLogLines=10000     # Maximum number of lines to keep in the all-time optimization log
@@ -89,6 +90,7 @@ parse_config_file() {
             MaxPerf) MaxPerf="$value" ;;
             DryRun) DryRun="$value" ;;
             DropPrivs) DropPrivs="$value" ;;
+            TunePipeWire) TunePipeWire="$value" ;;
             AutoGenConfig) AutoGenConfig="$value" ;;
             ReniceValue) ReniceValue="$value" ;;
             IoniceValue) IoniceValue="$value" ;;
@@ -173,6 +175,7 @@ EOF
 # State Tracking
 SystemTuned=""                    # Tracks if system optimizations are currently applied (true/false/empty)
 declare -A OptimizedPidsMap       # Map of PID -> Unix timestamp of when it was first optimized
+declare -A AlwaysOptimizePidsMap  # Map of PID -> 1 for processes that are optimized but will not trigger system management
 declare -A NonGamingPidsMap       # Map of PID -> Unix timestamp of when it was identified as non-gaming
 declare -A BatchedProcInfoMap     # Map of PID -> "PPID|COMM|ARGS"
 TotalOptimizedCount=0             # Total number of unique processes optimized since script start
@@ -255,6 +258,7 @@ usage() {
     echo "  -f, --max-perf       Force max PCIe performance (disable ASPM/Runtime PM)"
     echo "  -n, --dry-run        Dry-run mode (don't apply any changes)"
     echo "  -c, --no-config      Do not automatically create per-command local configs"
+    echo "  --no-pipewire        Do not optimize PipeWire processes"
     echo "  -k, --no-drop        Keep root privileges (do not drop to user)"
     echo "  --comm-pipe <path>   Use a specific path for the communication pipe"
     echo "  -m, --max-log-lines  Maximum all-time log lines (default: $MaxAllTimeLogLines)"
@@ -862,6 +866,13 @@ is_gaming_process() {
         ppid="$next_ppid"
     done
 
+    # 6. PipeWire processes
+    case "$proc_comm" in
+        pipewire|pipewire-pulse|pipewire-media-session|wireplumber)
+            return 0
+            ;;
+    esac
+
     NonGamingPidsMap["$pid"]=$(date +%s)
     return 1
 }
@@ -1330,9 +1341,27 @@ run_optimization() {
     # Cross-vendor PID detection (Render nodes and NVIDIA devices)
     local gpu_pids=$(fuser /dev/dri/renderD* /dev/nvidia* 2>/dev/null | tr ' ' '\n' | sort -u)
 
-    for pid in $gpu_pids; do
+    # Detect processes that should always be optimized but should not result in system-wide tuning
+    local always_optimize_pids=()
+    if [ "$TunePipeWire" = true ]; then
+        # pgrep -d' ' is a standard way to get a space-separated list of PIDs
+        local p_pids=$(pgrep -f "pipewire|pipewire-pulse|pipewire-media-session|wireplumber" 2>/dev/null)
+        if [ -n "$p_pids" ]; then
+            always_optimize_pids+=($p_pids)
+        fi
+    fi
+
+    local target_pids=$(echo -e "$gpu_pids\n${always_optimize_pids[*]}" | sort -u)
+
+    for pid in $target_pids; do
         [[ -z "$pid" ]] && continue
         if [ "$pid" -lt 100 ] || [ ! -d "$PROC_PREFIX/proc/$pid" ]; then continue; fi
+
+        for apid in "${always_optimize_pids[@]}"; do
+            if [ "$apid" == "$pid" ]; then
+                AlwaysOptimizePidsMap[$pid]=1
+            fi
+        done
 
         # Only optimize processes owned by the current user (unless root)
         if [ "$EUID" -ne 0 ] && [ ! -O "$PROC_PREFIX/proc/$pid" ]; then
@@ -1340,8 +1369,6 @@ run_optimization() {
         fi
 
         if ! is_gaming_process "$pid"; then continue; fi
-
-        trigger_system_management "tune"
 
         IFS='|' read -r proc_comm full_proc_cmd simplified_cmd raw_current_affinity <<< "$(get_proc_info "$pid")"
 
@@ -1428,6 +1455,10 @@ run_optimization() {
 
         # Restore globals for next process in the loop
     done
+
+    if [ $((${#OptimizedPidsMap[@]} - ${#AlwaysOptimizePidsMap[@]})) -gt 0 ]; then
+        trigger_system_management "tune"
+    fi
 }
 
 # Periodically prints a summary of optimized processes
@@ -1436,13 +1467,21 @@ summarize_optimizations() {
     local now=$(date +%s)
 
     # First, cleanup dead processes to get an accurate count
+    local always_optimized_count=0
     for pid in "${!OptimizedPidsMap[@]}"; do
         if [ ! -d "$PROC_PREFIX/proc/$pid" ]; then
             unset "OptimizedPidsMap[$pid]"
+            unset "AlwaysOptimizePidsMap[$pid]"
+        else
+          # Count only processes that are not always optimized for system management purposes
+          if [ -n "${AlwaysOptimizePidsMap[$pid]}" ]; then
+              ((always_optimized_count++))
+          fi
         fi
     done
 
     local current_optimized_count=${#OptimizedPidsMap[@]}
+    current_optimized_count=$((current_optimized_count - always_optimized_count))
 
     # Trigger summary if forced, interval passed, or if we just dropped to zero optimized processes
     local should_summarize=false
@@ -1454,7 +1493,7 @@ summarize_optimizations() {
 
     LastOptimizedCount=$current_optimized_count
 
-    local summary_msg="${current_optimized_count} processes currently optimized"
+    local summary_msg="$((current_optimized_count + always_optimized_count)) processes currently optimized (${current_optimized_count} triggering tune)"
     if [ "$current_optimized_count" -eq 0 ]; then
         trigger_system_management "restore"
     fi
@@ -1559,6 +1598,7 @@ parse_args() {
             -f|--max-perf) MaxPerf=true; shift ;;
             -n|--dry-run) DryRun=true; shift ;;
             -c|--no-config) AutoGenConfig=false; shift ;;
+            --no-pipewire) TunePipeWire=false; shift ;;
             -k|--no-drop) DropPrivs=false; shift ;;
             --comm-pipe) CommPipe=$2; shift 2 ;;
             -m|--max-log-lines)

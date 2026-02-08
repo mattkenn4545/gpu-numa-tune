@@ -38,6 +38,12 @@ FAILED=0
 #   1. Redefining commands as shell functions (e.g., ps(), lspci()).
 #   2. Using environment variables (SYSFS_PREFIX, PROC_PREFIX) to redirect file lookups.
 
+pgrep() {
+    if [[ "$*" == *"-f pipewire|pipewire-pulse|pipewire-media-session|wireplumber"* ]]; then
+        echo "4444 4445"
+    fi
+}
+
 # Create mocks for basic external commands
 lspci() {
     echo "0000:01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)"
@@ -45,6 +51,27 @@ lspci() {
 
 notify-send() {
     return 0
+}
+
+# Standardizes process information extraction
+get_proc_info() {
+    local pid="$1"
+    local cached_info="${BatchedProcInfoMap[$pid]}"
+    local proc_comm=""
+    local full_proc_cmd=""
+
+    if [ -n "$cached_info" ]; then
+        # cached_info is "ppid|comm|args"
+        IFS='|' read -r _ proc_comm full_proc_cmd <<< "$cached_info"
+    else
+        proc_comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+        full_proc_cmd=$(ps -fp "$pid" -o args= 2>/dev/null | tail -n 1)
+    fi
+
+    [ -z "$full_proc_cmd" ] && full_proc_cmd="[Hidden or Exited]"
+    local simplified_cmd=$(get_simplified_cmd "$pid" "$proc_comm" "$full_proc_cmd")
+    local raw_affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $2}')
+    echo "$proc_comm|$full_proc_cmd|$simplified_cmd|$raw_affinity"
 }
 
 # Source the script - the script has a guard [[ "${BASH_SOURCE[0]}" == "${0}" ]] 
@@ -87,6 +114,24 @@ assert_eq "true" "$DaemonMode" "parse_args --daemon"
 assert_eq "true" "$StrictMem" "parse_args --strict"
 assert_eq "1" "$GpuIndexArg" "parse_args GpuIndexArg"
 
+parse_args "--no-pipewire"
+assert_eq "false" "$TunePipeWire" "parse_args --no-pipewire"
+TunePipeWire=true # Reset
+
+# Test 2b: run_optimization skips PipeWire when TunePipeWire=false
+TunePipeWire=false
+PROC_PREFIX="$(pwd)/tests/mock_proc"
+mkdir -p "$PROC_PREFIX/proc/4444"
+mkdir -p "$PROC_PREFIX/proc/4445"
+# Clear cached info to force reload
+BatchedProcInfoMap=()
+OptimizedPidsMap=()
+PRINTF_OUTPUT=""
+run_optimization > /tmp/opt_output_nopipe 2>&1
+echo "$PRINTF_OUTPUT" | grep -q "4444" || grep -q "4444" /tmp/opt_output_nopipe
+assert_eq "1" "$?" "run_optimization skips PipeWire when TunePipeWire=false"
+TunePipeWire=true # Reset
+
 parse_args "-l" "-a" "-x" "-k" "-c" "--no-irq" "--comm-pipe" "/tmp/pipe"
 assert_eq "false" "$IncludeNearby" "parse_args --local-only"
 assert_eq "false" "$OnlyGaming" "parse_args --all-gpu-procs"
@@ -109,6 +154,8 @@ ps() {
         echo " 1111  2222 some_child      ./some_child"
         echo " 2222     1 steam           /usr/bin/steam"
         echo " 3333     1 wine_proc       /usr/bin/wine some_game.exe"
+        echo " 4444     1 pipewire        /usr/bin/pipewire"
+        echo " 4445     1 wireplumber     /usr/bin/wireplumber"
         echo " 9999     1 game_exe        game_exe"
         return
     fi
@@ -163,6 +210,8 @@ echo -e "STEAM_GAME_ID=123\0" > "$PROC_PREFIX/proc/1234/environ"
 assert_eq "0" "$(is_gaming_process 1234; echo $?)" "is_gaming_process with STEAM_GAME_ID (allowed)"
 assert_eq "0" "$(is_gaming_process 1111; echo $?)" "is_gaming_process child of steam (allowed)"
 assert_eq "0" "$(is_gaming_process 3333; echo $?)" "is_gaming_process wine .exe (allowed)"
+assert_eq "0" "$(is_gaming_process 4444; echo $?)" "is_gaming_process pipewire (allowed)"
+assert_eq "0" "$(is_gaming_process 4445; echo $?)" "is_gaming_process wireplumber (allowed)"
 
 # Test 3.1: is_gaming_process caching
 NonGamingPidsMap=()
@@ -339,24 +388,43 @@ DryRun=true # Reset for next tests
 # Mocking for run_optimization
 PROC_PREFIX="$(pwd)/tests/mock_proc"
 mkdir -p "$PROC_PREFIX/proc/9999"
+mkdir -p "$PROC_PREFIX/proc/4444"
+mkdir -p "$PROC_PREFIX/proc/4445"
 touch "$PROC_PREFIX/proc/9999/environ"
+touch "$PROC_PREFIX/proc/4444/environ"
+touch "$PROC_PREFIX/proc/4445/environ"
 echo -e "STEAM_GAME_ID=123\0" > "$PROC_PREFIX/proc/9999/environ"
 
 # Mocking fuser to return our test PID
 fuser() { echo "9999"; }
-# Mocking ps for PID 9999
+# Mocking ps for PIDs
 ps() {
     case "$*" in
         *"-p 9999 -o comm="*) echo "game_exe" ;;
+        *"-p 4444 -o comm="*) echo "pipewire" ;;
+        *"-p 4445 -o comm="*) echo "wireplumber" ;;
         *"-fp 9999 -o args="*) echo "./game_exe" ;;
+        *"-fp 4444 -o args="*) echo "/usr/bin/pipewire" ;;
+        *"-fp 4445 -o args="*) echo "/usr/bin/wireplumber" ;;
         *"-p 9999 -o ppid="*) echo "1" ;;
+        *"-p 4444 -o ppid="*) echo "1" ;;
+        *"-p 4445 -o ppid="*) echo "1" ;;
+        *"-eo pid,ppid,comm,args --no-headers"*)
+            echo " 9999     1 game_exe        ./game_exe"
+            echo " 4444     1 pipewire        /usr/bin/pipewire"
+            echo " 4445     1 wireplumber     /usr/bin/wireplumber"
+            ;;
         *) command ps "$@" ;;
     esac
 }
-# Mock taskset -pc 9999 to return some affinity
+# Mock taskset -pc PID to return some affinity
 taskset() {
     if [[ "$*" == "-pc 9999" ]]; then
         echo "pid 9999's current affinity list: 0-7"
+    elif [[ "$*" == "-pc 4444" ]]; then
+        echo "pid 4444's current affinity list: 0-7"
+    elif [[ "$*" == "-pc 4445" ]]; then
+        echo "pid 4445's current affinity list: 0-7"
     else
         TASKSET_CALLED=true
     fi
@@ -364,7 +432,13 @@ taskset() {
 
 TargetNormalizedMask="0,1,2,3" # Different from 0-7
 
-run_optimization
+run_optimization > /tmp/opt_output 2>&1
+echo "$PRINTF_OUTPUT" | grep -q "9999" || grep -q "9999" /tmp/opt_output
+assert_eq "0" "$?" "run_optimization processes PID 9999 (GPU)"
+echo "$PRINTF_OUTPUT" | grep -q "4444" || grep -q "4444" /tmp/opt_output
+assert_eq "0" "$?" "run_optimization processes PID 4444 (PipeWire)"
+echo "$PRINTF_OUTPUT" | grep -q "4445" || grep -q "4445" /tmp/opt_output
+assert_eq "0" "$?" "run_optimization processes PID 4445 (WirePlumber)"
 
 assert_eq "false" "$TASKSET_CALLED" "Dry-run: taskset not called"
 assert_eq "false" "$NUMACTL_CALLED" "Dry-run: numactl not called"
@@ -485,7 +559,7 @@ output=$(
     summarize_optimizations true
 )
 
-assert_eq "0 procs    | since startup    |                      | 5 all time         | OPTIMIZING                | 0 processes currently optimized" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
+assert_eq "0 procs    | since startup    |                      | 5 all time         | OPTIMIZING                | 0 processes currently optimized (0 triggering tune)" "$(echo "$output" | tail -n 1)" "Startup summary output matches expected format"
 
 # Test 11b: Startup summary -l option
 echo "Test 11b: Startup summary -l option"
@@ -914,7 +988,25 @@ MOCK_EUID=0
 PROC_PREFIX="$SYSFS_PREFIX" # Use same mock prefix for /proc
 mkdir -p "$PROC_PREFIX/proc/123"
 echo "VmRSS: 1000 kB" > "$PROC_PREFIX/proc/123/status"
-run_optimization > /dev/null
+# Mock pgrep to NOT return anything for PipeWire to ensure we trigger system tune via GPU process
+# We use a separate function name to avoid recursion if needed, but here simple redefinition is fine
+pgrep() { if [[ "$*" == *"-f"* ]]; then return 1; fi; command pgrep "$@"; }
+# Also need to make sure always_optimize_pids doesn't include 123
+TunePipeWire=false
+# Mock ps to return a real game name that is not kworker
+ps() {
+    if [[ "$*" == *"-p 123 -o comm="* ]]; then echo "game_exe";
+    elif [[ "$*" == *"-fp 123 -o args="* ]]; then echo "./game_exe";
+    elif [[ "$*" == *"-eo pid,ppid,comm,args --no-headers"* ]]; then
+        echo " 123     1 game_exe        ./game_exe"
+    else command ps "$@"; fi
+}
+# IMPORTANT: Reset maps that might have cached 123 as non-gaming
+NonGamingPidsMap=()
+OptimizedPidsMap=()
+AlwaysOptimizePidsMap=()
+run_optimization > /tmp/opt_output_trigger 2>&1
+TunePipeWire=true # Reset
 assert_eq "true" "$SystemTuned" "run_optimization triggers system tune"
 
 # Now mock process gone

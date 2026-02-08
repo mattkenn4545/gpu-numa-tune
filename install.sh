@@ -104,6 +104,9 @@ if [ ! -f "$INSTALL_CONFIG_PATH" ]; then
 # Create per-command default configuration files
 #AutoGenConfig=true
 
+# Also optimize PipeWire-related processes (true/false)
+#TunePipeWire=true
+
 # SystemTune Original values
 EOF
 else

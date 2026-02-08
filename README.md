@@ -24,6 +24,7 @@ In multi-node systems (like AMD Threadripper, EPYC, or multi-socket Intel setups
 - **⚙️ Per-Process Configuration:** Fine-tune settings like HT usage, memory locality, or process priority for specific games using dedicated `.conf` files (e.g., `Cyberpunk2077.exe.conf`).
 - **📈 All-Time Tracking:** Maintains a persistent log of every optimization across reboots, providing historical insights into your system's performance tuning.
 - **📊 Real-time Monitoring:** Periodically summarizes active optimizations and cleans up dead processes from tracking, with automatic silencing during periods of inactivity.
+- **🎧 Audio Alignment:** Automatically aligns PipeWire-related processes (like `pipewire` and `wireplumber`) to the same NUMA node as the GPU to minimize audio latency and synchronization issues.
 - **🛠️ Auto-Config Generation:** Automatically creates template configuration files for detected games, making it easy to customize per-process settings like priority and affinity.
 
 ---
@@ -106,6 +107,7 @@ GpuIndex=0
 | `MaxDist` | Max distance from `numactl -H` for "nearby" nodes | `11` |
 | `OnlyGaming` | Only optimize games and high-perf apps | `true` |
 | `MaxPerf` | Force max PCIe performance (disable ASPM/Runtime PM) | `true` |
+| `TunePipeWire` | Also optimize PipeWire-related processes | `true` |
 | `ReniceValue` | Nice value for optimized processes (-20 to 19, "" to skip) | `-10` |
 | `IoniceValue` | Ionice class/value (e.g., "best-effort:0", "" to skip) | `best-effort:0` |
 | `SkipSystemTune` | Skip modifying `sysctl` or CPU governors | `false` |
@@ -138,6 +140,7 @@ While the configuration file is recommended for persistent settings, you can ove
 - `-n, --dry-run`: Dry-run mode (sets `DryRun=true`).
 - `-m, --max-log-lines`: Set max log lines (sets `MaxAllTimeLogLines`).
 - `-c, --no-config`: Disable automatic configuration file generation (sets `AutoGenConfig=false`).
+- `--no-pipewire`: Disable PipeWire process optimization (sets `TunePipeWire=false`).
 - `-k, --no-drop`: Do not drop root privileges (sets `DropPrivs=false`).
 - `-h, --help`: Show full usage information.
 
