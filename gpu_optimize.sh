@@ -940,7 +940,7 @@ system_manage_settings() {
         # Reload config to ensure we have the latest original values for restoration
         [ -f "$SystemConfig" ] && parse_config_file "$SystemConfig"
         [ ! -f "$SystemConfig" ] && {
-            [ "$SystemTuned" = true ] && log "Warning: Restoration config $SystemConfig missing."
+            [ "$SystemTuned" = "true" ] || [ "$SystemTuned" = "" ] && log "Warning: Restoration config $SystemConfig missing."
             return 1
         }
         echo "Restoring system to original state..."
@@ -989,12 +989,18 @@ system_manage_settings() {
         if [ "$DryRun" = false ]; then
             SYSCTL_CALLED=true
             if sysctl -w "$key=$target_val" >/dev/null 2>&1; then
-                [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                if [ "$SystemTuned" = "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
+                    printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                fi
             else
-                [ "$SystemTuned" == "" ] && printf "  [FAIL] %-28s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                if [ "$SystemTuned" = "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
+                    printf "  [FAIL] %-28s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                fi
             fi
         else
-            [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+            if [ "$SystemTuned" = "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
+                printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+            fi
         fi
     }
 
@@ -1016,12 +1022,18 @@ system_manage_settings() {
 
         if [ "$DryRun" = false ]; then
             if echo "$target_val" > "$file_path" 2>/dev/null; then
-                [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                if [ "$SystemTuned" = "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
+                    printf "  [OK] %-30s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                fi
             else
-                [ "$SystemTuned" == "" ] && printf "  [FAIL] %-28s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                if [ "$SystemTuned" = "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
+                    printf "  [FAIL] %-28s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+                fi
             fi
         else
-            [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+            if [ "$SystemTuned" = "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
+                printf "  [DRY] %-29s -> %-10s (%s)\n" "$key" "$target_val" "$label"
+            fi
         fi
     }
 
@@ -1039,23 +1051,35 @@ system_manage_settings() {
         if [ "$action" = "tune" ]; then
             if [ "$DryRun" = false ]; then
                 if systemctl stop "$service" 2>/dev/null; then
-                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$service" "stopped" "Latency"
+                    if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "false" ]; then
+                        printf "  [OK] %-30s -> %-10s (%s)\n" "$service" "stopped" "Latency"
+                    fi
                 else
-                    [ "$SystemTuned" == "" ] && printf "  [FAIL] %-28s -> %-10s (%s)\n" "$service" "stop failed" "Latency"
+                    if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "false" ]; then
+                        printf "  [FAIL] %-28s -> %-10s (%s)\n" "$service" "stop failed" "Latency"
+                    fi
                 fi
             else
-                [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$service" "stop" "Latency"
+                if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "false" ]; then
+                    printf "  [DRY] %-29s -> %-10s (%s)\n" "$service" "stop" "Latency"
+                fi
             fi
         else
             # action = restore
             if [ "$DryRun" = false ]; then
                 if systemctl start "$service" 2>/dev/null; then
-                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "$service" "started" "Restore"
+                    if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "true" ]; then
+                        printf "  [OK] %-30s -> %-10s (%s)\n" "$service" "started" "Restore"
+                    fi
                 else
-                    [ "$SystemTuned" == "" ] && printf "  [FAIL] %-28s -> %-10s (%s)\n" "$service" "start failed" "Restore"
+                    if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "true" ]; then
+                        printf "  [FAIL] %-28s -> %-10s (%s)\n" "$service" "start failed" "Restore"
+                    fi
                 fi
             else
-                [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "$service" "start" "Restore"
+                if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "true" ]; then
+                    printf "  [DRY] %-29s -> %-10s (%s)\n" "$service" "start" "Restore"
+                fi
             fi
         fi
     }
@@ -1161,21 +1185,25 @@ system_manage_settings() {
     return 0
 }
 
-# Triggers system-wide action (tune/restore)
-trigger_system_management() {
-    local action="$1" # "tune" or "restore"
-    local target_state
-    local pipe_msg
+    # Triggers system-wide action (tune/restore)
+    # Returns 0 if already in target state or if request successfully handled
+    trigger_system_management() {
+        local action="$1" # "tune" or "restore"
+        local force="${2:-false}"
+        local target_state
+        local pipe_msg
 
-    if [ "$action" = "tune" ]; then
-        [ "$SystemTuned" = true ] && return 0
-        target_state=true
-        pipe_msg="TUNE"
-    else
-        [ "$SystemTuned" = false ] && return 0
-        target_state=false
-        pipe_msg="RESTORE"
-    fi
+        if [ "$action" = "tune" ]; then
+            [ "$SystemTuned" = "true" ] && [ "$force" = "false" ] && return 0
+            target_state=true
+            pipe_msg="TUNE"
+        else
+            [ "$SystemTuned" = "false" ] && [ "$force" = "false" ] && return 0
+            target_state=false
+            pipe_msg="RESTORE"
+        fi
+
+        log "trigger_system_management $action (SystemTuned=$SystemTuned, force=$force)"
 
     local eff_euid="${MOCK_EUID:-$EUID}"
     if [ "$eff_euid" -eq 0 ]; then
@@ -1726,8 +1754,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         while [ -e "/dev/fd/3" ]; do
             if read -t 1 -r cmd <&3 2>/dev/null; then
                 case "$cmd" in
-                    TUNE) system_manage_settings "tune" ;;
-                    RESTORE) system_manage_settings "restore" ;;
+                    TUNE) 
+                        system_manage_settings "tune"
+                        SystemTuned=true
+                        ;;
+                    RESTORE) 
+                        system_manage_settings "restore"
+                        SystemTuned=false
+                        ;;
                     EXIT) break ;;
                 esac
             fi
@@ -1753,6 +1787,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
     # Everything below runs either as root (if DropPrivs=false)
     # or as the target user (if DropPrivs=true, in the child process).
+
+    # Reset SystemTuned for the child/non-root process
+    SystemTuned=""
+
+    # Log child start
+    log "--> Monitoring process starting (SystemTuned=$SystemTuned)"
 
     # Initialize maps
     declare -A BatchedProcInfoMap
