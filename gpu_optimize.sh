@@ -1288,6 +1288,8 @@ migrate_process_memory() {
     local rss_kb="$3"
     # Safety buffer to ensure we don't fill the node completely (default 512MB)
     local safety_margin_kb="${4:-524288}"
+    # If true, ignore process age check
+    local ignore_age="${5:-false}"
 
     # --- CONFIGURATION ---
     # Max age in seconds (120s = 2 minutes).
@@ -1303,7 +1305,7 @@ migrate_process_memory() {
     local proc_age=$(ps -p "$pid" -o etimes= 2>/dev/null | tr -d ' ')
 
     # Verify we got a valid integer
-    if [[ "$proc_age" =~ ^[0-9]+$ ]]; then
+    if [ "$ignore_age" = false ] && [[ "$proc_age" =~ ^[0-9]+$ ]]; then
         if [ "$proc_age" -gt "$max_migration_age" ]; then
             # Return code 5: Process is too old to safely migrate
             return 5
@@ -1443,9 +1445,14 @@ run_optimization() {
             local process_rss_kb=$(awk '/VmRSS/ {print $2}' "$PROC_PREFIX/proc/$pid/status" 2>/dev/null || echo 0)
             local target_nodes="${l_NearbyNodeIds:-$l_NumaNodeId}"
 
+            local ignore_age=false
+            if [ -n "${AlwaysOptimizePidsMap[$pid]}" ]; then
+                ignore_age=true
+            fi
+
             local status_msg="OPTIMIZED"
             local skip_lifetime_optimized_count=false
-            if migrate_process_memory "$pid" "$target_nodes" "$process_rss_kb"; then
+            if migrate_process_memory "$pid" "$target_nodes" "$process_rss_kb" "" "$ignore_age"; then
                 [ "$target_nodes" != "-1" ] && status_msg="OPTIMIZED & MOVED"
             else
                 local m_res=$?
