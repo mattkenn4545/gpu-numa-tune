@@ -1,6 +1,8 @@
 [Unit]
 Description=GPU NUMA Node Affinity Optimizer
-After=network.target graphical.target
+After=network.target systemd-journald.service
+Conflicts=shutdown.target
+Before=shutdown.target
 Documentation=https://github.com/mattkenn4545/gpu-numa-tune
 
 [Service]

@@ -1361,11 +1361,16 @@ run_optimization() {
     # Batch load process info to minimize forks in the loop
     batch_load_proc_info
 
-    # Periodic cleanup of non-gaming cache to handle PID reuse
+    # Periodic cleanup of non-gaming cache and optimized pids to handle PID reuse
     local now=$(date +%s)
     for pid in "${!NonGamingPidsMap[@]}"; do
         if [ ! -d "$PROC_PREFIX/proc/$pid" ] || [ $((now - NonGamingPidsMap[$pid])) -gt 3600 ]; then
             unset "NonGamingPidsMap[$pid]"
+        fi
+    done
+    for pid in "${!OptimizedPidsMap[@]}"; do
+        if [ ! -d "$PROC_PREFIX/proc/$pid" ]; then
+            unset "OptimizedPidsMap[$pid]"
         fi
     done
 
@@ -1399,7 +1404,12 @@ run_optimization() {
             continue
         fi
 
-        if ! is_gaming_process "$pid"; then continue; fi
+        if ! is_gaming_process "$pid"; then 
+            # If it was previously optimized but is no longer a gaming process (e.g. it's now in the blacklist), 
+            # remove it from the optimized map so it doesn't trigger tuning.
+            unset "OptimizedPidsMap[$pid]"
+            continue 
+        fi
 
         IFS='|' read -r proc_comm full_proc_cmd simplified_cmd raw_current_affinity <<< "$(get_proc_info "$pid")"
 
@@ -1492,8 +1502,17 @@ run_optimization() {
         # Restore globals for next process in the loop
     done
 
-    if [ $((${#OptimizedPidsMap[@]} - ${#AlwaysOptimizePidsMap[@]})) -gt 0 ]; then
+    local triggering_count=0
+    for opid in "${!OptimizedPidsMap[@]}"; do
+        if [ -z "${AlwaysOptimizePidsMap[$opid]}" ]; then
+            ((triggering_count++))
+        fi
+    done
+
+    if [ "$triggering_count" -gt 0 ]; then
         trigger_system_management "tune"
+    else
+        trigger_system_management "restore"
     fi
 }
 
