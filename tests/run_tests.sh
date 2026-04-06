@@ -931,6 +931,7 @@ mkdir -p "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters"
 mkdir -p "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/power"
 mkdir -p "$SYSFS_PREFIX/sys/bus/pci/devices/$PciAddr/link"
 mkdir -p "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage"
+mkdir -p "$SYSFS_PREFIX/sys/devices/system/cpu/cpufreq"
 mkdir -p "$SYSFS_PREFIX/sys/devices/system/cpu/cpu0/cpufreq"
 
 echo "default" > "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy"
@@ -962,6 +963,7 @@ assert_eq "performance" "$(cat "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/po
 trigger_system_management "restore" > /dev/null
 assert_eq "false" "$SystemTuned" "trigger_system_management 'restore' sets SystemTuned=false"
 assert_eq "default" "$(cat "$SYSFS_PREFIX/sys/module/pcie_aspm/parameters/policy")" "system_restore applied"
+assert_eq "powersave" "$(cat "$SYSFS_PREFIX/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")" "cpu_governor restored"
 
 # Test trigger logic in run_optimization/summarize_optimizations
 LastOptimizedCount=0

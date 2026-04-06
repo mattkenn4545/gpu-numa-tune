@@ -1037,10 +1037,11 @@ system_manage_settings() {
         fi
     }
 
-    # Helper for managing systemd services. Does not persist state or use SystemConfig as whether the service is present is sufficient
+    # Helper for managing systemd services.
     manage_service() {
         local service_name="$1"
         local service="${service_name}.service"
+        local key="service_${service_name}_active"
 
         if [ "$DryRun" = false ]; then
           if ! systemctl list-unit-files "$service" >/dev/null 2>&1; then
@@ -1049,6 +1050,12 @@ system_manage_settings() {
         fi
 
         if [ "$action" = "tune" ]; then
+            local is_active="false"
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                is_active="true"
+            fi
+            persist_original_value "$key" "$is_active"
+
             if [ "$DryRun" = false ]; then
                 if systemctl stop "$service" 2>/dev/null; then
                     if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "false" ]; then
@@ -1066,19 +1073,22 @@ system_manage_settings() {
             fi
         else
             # action = restore
-            if [ "$DryRun" = false ]; then
-                if systemctl start "$service" 2>/dev/null; then
-                    if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "true" ]; then
-                        printf "  [OK] %-30s -> %-10s (%s)\n" "$service" "started" "Restore"
+            local was_active=$(get_target_val "$key" "false")
+            if [ "$was_active" = "true" ]; then
+                if [ "$DryRun" = false ]; then
+                    if systemctl start "$service" 2>/dev/null; then
+                        if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "true" ]; then
+                            printf "  [OK] %-30s -> %-10s (%s)\n" "$service" "started" "Restore"
+                        fi
+                    else
+                        if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "true" ]; then
+                            printf "  [FAIL] %-28s -> %-10s (%s)\n" "$service" "start failed" "Restore"
+                        fi
                     fi
                 else
                     if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "true" ]; then
-                        printf "  [FAIL] %-28s -> %-10s (%s)\n" "$service" "start failed" "Restore"
+                        printf "  [DRY] %-29s -> %-10s (%s)\n" "$service" "start" "Restore"
                     fi
-                fi
-            else
-                if [ "$SystemTuned" = "" ] || [ "$SystemTuned" = "true" ]; then
-                    printf "  [DRY] %-29s -> %-10s (%s)\n" "$service" "start" "Restore"
                 fi
             fi
         fi
@@ -1097,8 +1107,16 @@ system_manage_settings() {
             local affinity_file="$PROC_PREFIX/proc/irq/$irq/smp_affinity_list"
             [ -f "$affinity_file" ] || continue
 
+            local target_val=$(get_target_val "$key" "$TargetNormalizedMask")
+            [ -z "$target_val" ] && continue
+
+            if [ "$action" = "tune" ]; then
+                local current_val=$(cat "$affinity_file" 2>/dev/null)
+                persist_original_value "$key" "$current_val"
+            fi
+
             if [ "$DryRun" = false ]; then
-                if echo "$TargetNormalizedMask" > "$affinity_file" 2>/dev/null; then
+                if echo "$target_val" > "$affinity_file" 2>/dev/null; then
                     tuned_irqs+=("$irq")
                 else
                     failed_irqs+=("$irq")
@@ -1108,7 +1126,7 @@ system_manage_settings() {
             fi
         done
 
-        if [ "$SystemTuned" == "" ]; then
+        if [ "$SystemTuned" == "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
             if [ ${#tuned_irqs[@]} -gt 0 ]; then
                 local irq_list=$(format_range "$(echo "${tuned_irqs[@]}" | tr ' ' ',')")
                 local label="IRQ Affinity"
@@ -1136,6 +1154,8 @@ system_manage_settings() {
     manage_sysctl "net.core.busy_poll" "50" "Network Latency"
     manage_sysctl "vm.stat_interval" "10" "Jitter Reduction"
     manage_sysctl "kernel.nmi_watchdog" "0" "Interrupt Latency"
+    manage_setting "thp_enabled" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/enabled" "never" "Jitter"
+    manage_setting "thp_defrag" "$SYSFS_PREFIX/sys/kernel/mm/transparent_hugepage/defrag" "never" "Jitter"
     manage_service irqbalance
     manage_service numad
     manage_irq_affinity
@@ -1166,10 +1186,14 @@ system_manage_settings() {
                     fi
                 done
                 if [ "$gov_applied" = true ]; then
-                    [ "$SystemTuned" == "" ] && printf "  [OK] %-30s -> %-10s (%s)\n" "cpu_governor" "$target_gov" "Power/Perf"
+                    if [ "$SystemTuned" == "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
+                        printf "  [OK] %-30s -> %-10s (%s)\n" "cpu_governor" "$target_gov" "$([ "$action" = "tune" ] && echo "Power/Perf" || echo "Restore")"
+                    fi
                 fi
             else
-                [ "$SystemTuned" == "" ] && printf "  [DRY] %-29s -> %-10s (%s)\n" "cpu_governor" "$target_gov" "Power/Perf"
+                if [ "$SystemTuned" == "" ] || { [ "$action" = "tune" ] && [ "$SystemTuned" = "false" ]; } || { [ "$action" = "restore" ] && [ "$SystemTuned" = "true" ]; }; then
+                    printf "  [DRY] %-29s -> %-10s (%s)\n" "cpu_governor" "$target_gov" "$([ "$action" = "tune" ] && echo "Power/Perf" || echo "Restore")"
+                fi
             fi
         fi
     fi
